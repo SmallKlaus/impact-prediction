@@ -1,0 +1,38 @@
+{
+      "train_jsonl":        "/data1/amine/IMPACT_TRAINING_SAMPLES/NEW_SAMPLES/train.jsonl",
+      "val_jsonl":          "/data1/amine/IMPACT_TRAINING_SAMPLES/NEW_SAMPLES/val_full.jsonl",
+      "output_dir":         "/data1/amine/checkpoints/run_006",
+      "model": {
+        "model_name":         "/data1/amine/unixcoder-base",
+        "proj_dim":           256,
+        "interaction_hidden": 256,
+        "dropout":            0.1,
+        "freeze_backbone":    true,
+        "n_unfreeze_layers":  0,
+	"use_attention_pool": true
+      },
+      "loss": {
+        "focal_alpha":        0.75,
+        "focal_gamma":        2.0,
+        "lambda_contrastive": 0.1,
+        "contrastive_temp":   0.07
+      },
+      "training": {
+        "batch_size":         16,
+        "warmup_epochs":      2,
+        "total_epochs":       10,
+        "unfreeze_epoch":     3,
+        "n_unfreeze_layers":  2,
+        "lr_head":            1e-4,
+        "lr_backbone":        1e-5,
+        "weight_decay":       0.01,
+        "max_grad_norm":      1.0,
+        "max_chunk_tokens":   512,
+        "max_class_tokens":   512,
+        "max_chunks":         4,
+        "label_smoothing":    0.0,
+        "num_workers":        4,
+        "eval_every_n_steps": 250,
+        "patience":           3
+      }
+    }
