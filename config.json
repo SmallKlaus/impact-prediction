@@ -9,7 +9,7 @@
         "dropout":            0.1,
         "freeze_backbone":    true,
         "n_unfreeze_layers":  0,
-	"use_attention_pool": true
+	      "use_attention_pool": true
       },
       "loss": {
         "focal_alpha":        0.75,
@@ -34,5 +34,12 @@
         "num_workers":        4,
         "eval_every_n_steps": 250,
         "patience":           3
+      },
+      "hard_negative_mining": {
+        "enabled":          false,
+        "train_full_jsonl": "/data1/amine/IMPACT_TRAINING_SAMPLES/NEW_SAMPLES/train_full.jsonl",
+        "start_epoch":      2,
+        "top_k_per_issue":  null,
+        "embed_batch_size": 64
       }
     }

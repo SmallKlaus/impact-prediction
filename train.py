@@ -93,11 +93,12 @@ import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
-from model   import ImpactScoreModel, build_model
-from dataset import build_dataloaders, SampleBatch
-from loss    import CombinedLoss, build_loss
+from model               import ImpactScoreModel, build_model
+from dataset             import build_dataloaders, SampleBatch, collate_fn
+from loss                import CombinedLoss, build_loss
+from hard_negative_miner import build_miner_from_config, HardNegativeMiner
 
 logging.basicConfig(
     level=logging.INFO,
@@ -275,6 +276,92 @@ def build_optimizer(
     return AdamW(param_groups, weight_decay=weight_decay)
 
 
+# ── Dynamic hard-negative mining helpers ──────────────────────────────────────
+
+def _rebuild_train_loader(train_loader: DataLoader) -> DataLoader:
+    """Rebuild the train DataLoader after mutating the underlying dataset.
+
+    Workers fork their own copy of the dataset, so once the dataset's `samples`
+    list has been swapped we need a fresh loader for the new state to take
+    effect under `num_workers > 0`.
+    """
+    return DataLoader(
+        train_loader.dataset,
+        batch_size  = train_loader.batch_size,
+        shuffle     = True,
+        collate_fn  = train_loader.collate_fn,
+        num_workers = train_loader.num_workers,
+        pin_memory  = train_loader.pin_memory,
+    )
+
+
+def _resolve_per_issue_top_k(
+    jira_ids:     list[str],
+    initial_cnts: dict[str, int],
+    override_k:   Optional[int],
+) -> dict[str, int]:
+    """Pick the hard-neg budget per issue.
+
+    If `top_k_per_issue` is set in config, use it for every issue.
+    Otherwise fall back to the per-issue count observed in the original
+    train.jsonl so the dataset's pos / hard-neg / easy-neg ratio stays the
+    same as before.
+    """
+    if override_k is not None and override_k > 0:
+        return {jid: override_k for jid in jira_ids}
+    return {jid: initial_cnts.get(jid, 0) for jid in jira_ids}
+
+
+def _maybe_mine_hard_negatives(
+    epoch:        int,
+    miner:        Optional[HardNegativeMiner],
+    hnm_cfg:      dict,
+    train_loader: DataLoader,
+    model:        ImpactScoreModel,
+    device:       torch.device,
+    initial_hn_counts: dict[str, int],
+) -> DataLoader:
+    """Run one mining pass at the *start* of `epoch` if conditions are met.
+
+    Returns the (possibly rebuilt) train_loader.
+    """
+    if miner is None:
+        return train_loader
+
+    start_epoch = int(hnm_cfg.get("start_epoch", 2))
+    if epoch < start_epoch:
+        return train_loader
+
+    train_ds = train_loader.dataset
+    jira_ids = train_ds.training_jira_ids()
+
+    per_issue_top_k = _resolve_per_issue_top_k(
+        jira_ids     = jira_ids,
+        initial_cnts = initial_hn_counts,
+        override_k   = hnm_cfg.get("top_k_per_issue"),
+    )
+
+    log.info(
+        "Epoch %d: mining hard negatives for %d issues (sum top_k = %d) ...",
+        epoch, len(jira_ids), sum(per_issue_top_k.values()),
+    )
+
+    mined = miner.mine(
+        model            = model,
+        device           = device,
+        per_issue_top_k  = per_issue_top_k,
+        jira_ids         = jira_ids,
+    )
+
+    n_hn = train_ds.replace_hard_negatives(mined)
+    log.info(
+        "Epoch %d: hard-neg slice replaced — %d HN samples now in training set (total %d).",
+        epoch, n_hn, len(train_ds),
+    )
+
+    return _rebuild_train_loader(train_loader)
+
+
 # ── Training loop ─────────────────────────────────────────────────────────────
 
 def train(config: dict):
@@ -310,6 +397,27 @@ def train(config: dict):
     log.info("Train samples: %d  |  Val samples: %d",
              len(train_loader.dataset), len(val_loader.dataset))
 
+    # ── Dynamic hard-negative miner (optional) ────────────────────────────────
+    hnm_cfg = config.get("hard_negative_mining", {}) or {}
+    initial_hn_counts = train_loader.dataset.per_issue_hard_neg_counts()
+    miner: Optional[HardNegativeMiner] = None
+    if hnm_cfg.get("enabled", False):
+        train_jids = set(train_loader.dataset.training_jira_ids())
+        log.info(
+            "Hard-negative mining ENABLED — start_epoch=%d, top_k_per_issue=%s, "
+            "embed_batch_size=%d",
+            int(hnm_cfg.get("start_epoch", 2)),
+            hnm_cfg.get("top_k_per_issue"),
+            int(hnm_cfg.get("embed_batch_size", 64)),
+        )
+        miner = build_miner_from_config(
+            config,
+            tokenizer            = tokenizer,
+            restrict_to_jira_ids = train_jids,
+        )
+    else:
+        log.info("Hard-negative mining DISABLED — using static dependency-seeded HNs.")
+
     # ── Model, loss, optimizer ────────────────────────────────────────────────
     log.info("Building model ...")
     model   = build_model(config["model"]).to(device)
@@ -338,6 +446,30 @@ def train(config: dict):
              tcfg["total_epochs"], tcfg["warmup_epochs"], tcfg["unfreeze_epoch"])
 
     for epoch in range(1, tcfg["total_epochs"] + 1):
+
+        # ── Dynamic hard-negative mining (start of epoch) ─────────────────────
+        # Epoch 1 keeps the dependency-seeded HNs from train.jsonl; from
+        # `start_epoch` onwards we replace them with model-mined ones.
+        if miner is not None:
+            prev_n_batches = len(train_loader)
+            train_loader = _maybe_mine_hard_negatives(
+                epoch              = epoch,
+                miner              = miner,
+                hnm_cfg            = hnm_cfg,
+                train_loader       = train_loader,
+                model              = model,
+                device             = device,
+                initial_hn_counts  = initial_hn_counts,
+            )
+            new_n_batches = len(train_loader)
+            if new_n_batches != prev_n_batches:
+                # Dataset size can shift slightly if some issues lose candidates.
+                # Rebuild the scheduler for the remaining epochs so cosine
+                # annealing still terminates correctly.
+                remaining_steps = new_n_batches * (tcfg["total_epochs"] - epoch + 1)
+                scheduler = CosineAnnealingLR(
+                    optimizer, T_max=max(remaining_steps, 1), eta_min=1e-6
+                )
 
         # ── Unfreeze backbone after warmup ────────────────────────────────────
         if epoch == tcfg["unfreeze_epoch"] and not unfrozen:

@@ -92,6 +92,67 @@ class ImpactSampleDataset(Dataset):
         self.samples: list[dict] = []
         self._load(Path(jsonl_path), issues_filter)
 
+        # Stable buckets for dynamic hard-negative mining.
+        # `_static_samples` holds positives + easy negs (anything that is not a
+        # dependency-seeded hard negative). `_hard_neg_samples` is the slice
+        # that can be replaced epoch-to-epoch via `replace_hard_negatives()`.
+        # Until the first replace call, `_hard_neg_samples` mirrors what was
+        # loaded from disk so behaviour is identical to the legacy setup.
+        self._static_samples: list[dict] = [
+            s for s in self.samples if not s.get("is_hard_negative", False)
+        ]
+        self._hard_neg_samples: list[dict] = [
+            s for s in self.samples if s.get("is_hard_negative", False)
+        ]
+
+    # ── Dynamic hard-negative support ────────────────────────────────────────
+    def per_issue_hard_neg_counts(self) -> dict[str, int]:
+        """Return {jira_id: number_of_initial_hard_negs} from the loaded file.
+
+        Used by the miner to keep the per-issue HN budget identical to the
+        dependency-seeded one, so the global pos:hard-neg:easy-neg ratio stays
+        constant across epochs.
+        """
+        counts: dict[str, int] = {}
+        for s in self._hard_neg_samples:
+            jid = s.get("jira_id", "")
+            counts[jid] = counts.get(jid, 0) + 1
+        return counts
+
+    def training_jira_ids(self) -> list[str]:
+        """All jira_ids that appear with at least one positive in this split."""
+        seen: dict[str, bool] = {}
+        for s in self._static_samples + self._hard_neg_samples:
+            jid = s.get("jira_id", "")
+            if jid and jid not in seen:
+                seen[jid] = True
+        return list(seen.keys())
+
+    def replace_hard_negatives(self, new_hard_negs_by_jira: dict[str, list[dict]]) -> int:
+        """Swap the hard-negative slice for the next epoch.
+
+        For any jira_id absent (or with an empty list) in the input the previous
+        hard negatives for that issue are kept — this lets callers handle issues
+        whose candidate pool is unavailable gracefully.
+
+        Returns the number of hard-negative samples in the new dataset.
+        """
+        previous_by_jira: dict[str, list[dict]] = {}
+        for s in self._hard_neg_samples:
+            previous_by_jira.setdefault(s.get("jira_id", ""), []).append(s)
+
+        new_hard_negs: list[dict] = []
+        for jid, prev_list in previous_by_jira.items():
+            replacement = new_hard_negs_by_jira.get(jid)
+            if replacement:
+                new_hard_negs.extend(replacement)
+            else:
+                new_hard_negs.extend(prev_list)
+
+        self._hard_neg_samples = new_hard_negs
+        self.samples = self._static_samples + self._hard_neg_samples
+        return len(self._hard_neg_samples)
+
     def _load(self, path: Path, issues_filter: Optional[set]):
         with open(path, encoding="utf-8") as f:
             for line in f:
