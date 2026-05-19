@@ -589,6 +589,76 @@ def train(config: dict):
 
     log.info("Training complete. Best Recall@10: %.4f", best_recall_at_10)
 
+    # ── Final test evaluation ─────────────────────────────────────────────────
+    # Runs automatically if "test_jsonl" is present in config.
+    # Always uses the best checkpoint, never the last epoch's weights.
+    test_path = config.get("test_jsonl")
+    if test_path and Path(test_path).exists():
+        best_path = output_dir / "best_model.pt"
+        if not best_path.exists():
+            log.warning("test_jsonl is set but best_model.pt not found — skipping test evaluation.")
+        else:
+            log.info("=" * 60)
+            log.info("FINAL TEST EVALUATION")
+            log.info("Checkpoint : %s", best_path)
+            log.info("Test set   : %s", test_path)
+            log.info("=" * 60)
+ 
+            # Load best weights into the model (already on device)
+            model.load_state_dict(torch.load(best_path, map_location=device))
+ 
+            # Build test dataloader — same settings as val
+            from dataset import ImpactSampleDataset
+            test_ds = ImpactSampleDataset(
+                jsonl_path       = test_path,
+                tokenizer        = tokenizer,
+                max_chunk_tokens = tcfg.get("max_chunk_tokens", 512),
+                max_class_tokens = tcfg.get("max_class_tokens", 512),
+                max_chunks       = tcfg.get("max_chunks", 8),
+                label_smoothing  = 0.0,
+            )
+            test_loader = DataLoader(
+                test_ds,
+                batch_size  = tcfg["batch_size"] * 2,
+                shuffle     = False,
+                collate_fn  = collate_fn,
+                num_workers = tcfg.get("num_workers", 4),
+                pin_memory  = True,
+            )
+            log.info("Test samples: %d", len(test_ds))
+ 
+            test_metrics = evaluate(model, test_loader, loss_fn, device)
+ 
+            log.info(
+                "TEST  val_loss=%.4f  R@5=%.4f  R@10=%.4f  R@20=%.4f  R@50=%.4f  "
+                "NDCG@10=%.4f  MAP=%.4f  AUC=%.4f",
+                test_metrics["val_loss"],
+                test_metrics.get("recall@5",  0),
+                test_metrics.get("recall@10", 0),
+                test_metrics.get("recall@20", 0),
+                test_metrics.get("recall@50", 0),
+                test_metrics.get("ndcg@10",   0),
+                test_metrics.get("map",        0),
+                test_metrics.get("auc_roc",    0),
+            )
+ 
+            # Persist test results alongside training metrics
+            test_results_path = output_dir / "test_metrics.json"
+            with open(test_results_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "checkpoint": str(best_path),
+                        "test_jsonl": test_path,
+                        "best_val_recall@10": best_recall_at_10,
+                        **{f"test_{k}": v for k, v in test_metrics.items()},
+                    },
+                    f, indent=2,
+                )
+            log.info("Test metrics saved to %s", test_results_path)
+    elif test_path:
+        log.warning("test_jsonl is set to '%s' but the file was not found — skipping.", test_path)
+    else:
+        log.info("No test_jsonl in config — skipping final test evaluation.")
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
