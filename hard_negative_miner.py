@@ -117,17 +117,29 @@ class CandidatePool:
                     by_jira_positives[jid].add(cpath)
 
                 by_jira_sha[jid] = sha
+
                 if jid not in by_jira_feature:
-                    by_jira_feature[jid] = (
-                        rec.get("feature_text", ""),
-                        rec.get("feature_chunks", []),
-                    )
+                    chunks = rec.get("feature_chunks", [])
+                    text = "" if chunks else rec.get("feature_text", "")
+                    by_jira_feature[jid] = (text, chunks)
 
                 # Only the first occurrence of (sha, cpath) is kept in the candidate list
                 if cpath in seen_in_sha[sha]:
                     continue
                 seen_in_sha[sha].add(cpath)
-                by_sha[sha].append(rec)
+                slim_rec = {
+                    "sha_before":       sha,
+                    "class_path":       cpath,
+                    "class_fqn":        rec.get("class_fqn", ""),
+                    "class_text":       rec.get("class_text", ""),
+                    "dependency_score": rec.get("dependency_score", 0.0),
+                    "dependency_fwd":   rec.get("dependency_fwd", 0.0),
+                    "dependency_rev":   rec.get("dependency_rev", 0.0),
+                    "depth_fwd":        rec.get("depth_fwd"),
+                    "depth_rev":        rec.get("depth_rev"),
+                    "is_seed":          rec.get("is_seed", False),
+                }
+                by_sha[sha].append(slim_rec)
 
         log.info(
             "  Candidate pool: %d lines  |  %d unique sha_before  |  %d jira_ids  |  %d unique (sha,class) pairs",
