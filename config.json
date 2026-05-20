@@ -1,7 +1,8 @@
 {
-      "train_jsonl":        "/data1/amine/IMPACT_TRAINING_SAMPLES/NEW_SAMPLES/train.jsonl",
-      "val_jsonl":          "/data1/amine/IMPACT_TRAINING_SAMPLES/NEW_SAMPLES/val_full.jsonl",
-      "output_dir":         "/data1/amine/checkpoints/run_006",
+      "train_jsonl":        "/data1/amine/IMPACT_TRAINING_SAMPLES/SAMPLES_V3/train.jsonl",
+      "val_jsonl":          "/data1/amine/IMPACT_TRAINING_SAMPLES/SAMPLES_V3/val_1000.jsonl",
+      "test_jsonl":         "/data1/amine/IMPACT_TRAINING_SAMPLES/SAMPLES_V3/test_1000.jsonl",
+      "output_dir":         "/data1/amine/checkpoints/run_007",
       "model": {
         "model_name":         "/data1/amine/unixcoder-base",
         "proj_dim":           256,
@@ -36,10 +37,10 @@
         "patience":           3
       },
       "hard_negative_mining": {
-        "enabled":          false,
-        "train_full_jsonl": "/data1/amine/IMPACT_TRAINING_SAMPLES/NEW_SAMPLES/train_full.jsonl",
+        "enabled":          true,
+        "train_full_jsonl": "/data1/amine/IMPACT_TRAINING_SAMPLES/SAMPLES_V3/train_full.jsonl",
         "start_epoch":      2,
         "top_k_per_issue":  null,
-        "embed_batch_size": 64
+        "embed_batch_size": 32
       }
     }

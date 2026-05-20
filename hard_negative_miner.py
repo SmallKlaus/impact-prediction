@@ -78,6 +78,11 @@ class CandidatePool:
         path = Path(path)
         log.info("Loading candidate pool from %s ...", path)
 
+        # 1. Quick pre-count to enable exact (n / total) tracking in the progress bar
+        log.info("Calculating total samples...")
+        with open(path, "r", encoding="utf-8") as f:
+            total_lines = sum(1 for _ in f)
+
         by_sha:           dict[str, list[dict]] = defaultdict(list)
         by_jira_positives: dict[str, set[str]]  = defaultdict(set)
         by_jira_sha:      dict[str, str]        = {}
@@ -88,8 +93,9 @@ class CandidatePool:
         seen_in_sha: dict[str, set[str]] = defaultdict(set)
 
         n_lines = 0
+        # 2. Wrap the file reader in tqdm with the total line count
         with open(path, encoding="utf-8") as f:
-            for line in f:
+            for line in tqdm(f, total=total_lines, desc="Loading candidate pool", unit=" samples"):
                 line = line.strip()
                 if not line:
                     continue
