@@ -38,9 +38,10 @@
       },
       "hard_negative_mining": {
         "enabled":          true,
-        "train_full_jsonl": "/data1/amine/IMPACT_TRAINING_SAMPLES/SAMPLES_V3/train_full.jsonl",
+        "train_full_jsonl": "/data1/amine/IMPACT_TRAINING_SAMPLES/SAMPLES_V3/train_1000.jsonl",
         "start_epoch":      2,
         "top_k_per_issue":  null,
-        "embed_batch_size": 32
+        "embed_batch_size": 256,
+        "mine_every_n_epochs": 2
       }
     }

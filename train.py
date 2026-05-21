@@ -329,7 +329,17 @@ def _maybe_mine_hard_negatives(
         return train_loader
 
     start_epoch = int(hnm_cfg.get("start_epoch", 2))
+    mine_every = int(hnm_cfg.get("mine_every_n_epochs", 1))
+    epochs_since = epoch - start_epoch
+
     if epoch < start_epoch:
+        return train_loader
+
+    if epochs_since % mine_every != 0:
+        log.info(
+            "Epoch %d: skipping mining (only runs every %d epochs, next at epoch %d).",
+            epoch, mine_every, epoch + (mine_every - epochs_since % mine_every)
+        )
         return train_loader
 
     train_ds = train_loader.dataset
