@@ -1,8 +1,8 @@
 {
       "train_jsonl":        "/data1/amine/IMPACT_TRAINING_SAMPLES/SAMPLES_V3/train.jsonl",
-      "val_jsonl":          "/data1/amine/IMPACT_TRAINING_SAMPLES/SAMPLES_V3/val_1000.jsonl",
-      "test_jsonl":         "/data1/amine/IMPACT_TRAINING_SAMPLES/SAMPLES_V3/test_1000.jsonl",
-      "output_dir":         "/data1/amine/checkpoints/run_007",
+      "val_jsonl":          "/data1/amine/IMPACT_TRAINING_SAMPLES/SAMPLES_V3/val_500.jsonl",
+      "test_jsonl":         "/data1/amine/IMPACT_TRAINING_SAMPLES/SAMPLES_V3/test_full.jsonl",
+      "output_dir":         "/data1/amine/checkpoints/run_008",
       "model": {
         "model_name":         "/data1/amine/unixcoder-base",
         "proj_dim":           256,
@@ -40,6 +40,7 @@
         "enabled":          true,
         "train_full_jsonl": "/data1/amine/IMPACT_TRAINING_SAMPLES/SAMPLES_V3/train_1000.jsonl",
         "start_epoch":      2,
+        "hnm_threshold":    0.7,
         "top_k_per_issue":  null,
         "embed_batch_size": 256,
         "mine_every_n_epochs": 2

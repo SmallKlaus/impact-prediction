@@ -85,6 +85,15 @@ def average_precision(scores: list, labels: list) -> float:
     return ap / n_pos if n_pos else 0.0
 
 
+def mean_reciprocal_rank(scores: list, labels: list) -> float:
+    """MRR: reciprocal rank of the first positive in the ranked list."""
+    ranked = sorted(zip(scores, labels), key=lambda x: -x[0])
+    for i, (_, lbl) in enumerate(ranked):
+        if lbl:
+            return 1.0 / (i + 1)
+    return 0.0
+
+
 def project_of(jira_id: str) -> str:
     """Infer project name from Jira ID prefix."""
     prefix = jira_id.split("-")[0].upper()
@@ -216,7 +225,7 @@ def diagnose(
         issue_scores[jid].append(score)
         issue_labels[jid].append(label)
 
-    KS = [5, 10, 20, 50]
+    KS = [5, 10, 20, 50, 80, 100]
 
     # ── Per-issue metrics ─────────────────────────────────────────────────────
     per_issue: dict[str, dict] = {}
@@ -229,6 +238,7 @@ def diagnose(
             "n_candidates": len(s),
             "n_positives":  sum(l),
             "map":          round(average_precision(s, l), 4),
+            "mrr":          round(mean_reciprocal_rank(s, l), 4),
         }
         for k in KS:
             entry[f"recall@{k}"]  = round(recall_at_k(s, l, k), 4)
@@ -253,6 +263,7 @@ def diagnose(
                for k in KS},
             "ndcg@10":  aggregate([e["ndcg@10"]  for e in proj_entries]),
             "map":      aggregate([e["map"]       for e in proj_entries]),
+            "mrr":      aggregate([e["mrr"]       for e in proj_entries]),
         }
 
     # ── Global aggregate ──────────────────────────────────────────────────────
@@ -266,6 +277,7 @@ def diagnose(
                                / len(all_entries), 4)
            for k in [k for k in KS if k <= 20]},
         "map": round(sum(e["map"] for e in all_entries) / len(all_entries), 4),
+        "mrr": round(sum(e["mrr"] for e in all_entries) / len(all_entries), 4),
     }
 
     # ── R@10 distribution ─────────────────────────────────────────────────────
@@ -285,13 +297,14 @@ def diagnose(
     worst = sorted(per_issue.items(), key=lambda x: x[1]["recall@10"])[:worst_n]
     worst_issues = [
         {
-            "jira_id":     jid,
-            "project":     entry["project"],
-            "recall@10":   entry["recall@10"],
-            "recall@50":   entry["recall@50"],
-            "map":         entry["map"],
+            "jira_id":      jid,
+            "project":      entry["project"],
+            "recall@10":    entry["recall@10"],
+            "recall@50":    entry["recall@50"],
+            "mrr":          entry["mrr"],
+            "map":          entry["map"],
             "n_candidates": entry["n_candidates"],
-            "n_positives": entry["n_positives"],
+            "n_positives":  entry["n_positives"],
         }
         for jid, entry in worst
     ]
@@ -320,6 +333,7 @@ def diagnose(
         print(f"  Recall@{k:<3}       : {global_metrics[f'recall@{k}']:.4f}")
     print(f"  NDCG@10          : {global_metrics['ndcg@10']:.4f}")
     print(f"  MAP              : {global_metrics['map']:.4f}")
+    print(f"  MRR              : {global_metrics['mrr']:.4f}")
 
     print("\n" + "=" * 70)
     print("R@10 DISTRIBUTION")
@@ -331,32 +345,34 @@ def diagnose(
     print(f"  R@10 = 1.0       : {distribution['r10_eq_1']:4d}  ({100*distribution['r10_eq_1']/n:.1f}%)")
     print(f"  Mean / Std       : {distribution['r10_mean']:.4f} / {distribution['r10_std']:.4f}")
 
-    print("\n" + "=" * 70)
-    print("PER-PROJECT SUMMARY  (macro-avg R@10 across issues)")
-    print("=" * 70)
-    print(f"  {'Project':<18} {'Issues':>6}  {'R@5':>6}  {'R@10':>6}  {'R@20':>6}  {'R@50':>6}  {'MAP':>6}")
-    print("  " + "-" * 62)
+    print("\n" + "=" * 85)
+    print("PER-PROJECT SUMMARY  (macro-avg R@50 across issues)")
+    print("=" * 85)
+    print(f"  {'Project':<18} {'Issues':>6}  {'R@10':>6}  {'R@50':>6}  {'R@80':>6}  {'R@100':>6}  {'MAP':>6}  {'MRR':>6}")
+    print("  " + "-" * 75)
     for proj, stats in sorted(per_project.items()):
         print(
             f"  {proj:<18} {stats['n_issues']:>6}  "
-            f"{stats['recall@5']['mean']:>6.4f}  "
             f"{stats['recall@10']['mean']:>6.4f}  "
-            f"{stats['recall@20']['mean']:>6.4f}  "
             f"{stats['recall@50']['mean']:>6.4f}  "
-            f"{stats['map']['mean']:>6.4f}"
+            f"{stats['recall@80']['mean']:>6.4f}  "
+            f"{stats['recall@100']['mean']:>6.4f}  "
+            f"{stats['map']['mean']:>6.4f}  "
+            f"{stats['mrr']['mean']:>6.4f}"
         )
 
-    print("\n" + "=" * 70)
+    print("\n" + "=" * 80)
     print(f"WORST {worst_n} ISSUES BY R@10")
-    print("=" * 70)
+    print("=" * 80)
     print(f"  {'Jira ID':<20} {'Project':<16} {'R@10':>6}  {'R@50':>6}  "
-          f"{'MAP':>6}  {'Cands':>6}  {'Pos':>4}")
-    print("  " + "-" * 70)
+          f"{'MRR':>6}  {'MAP':>6}  {'Cands':>6}  {'Pos':>4}")
+    print("  " + "-" * 78)
     for w in worst_issues:
         print(
             f"  {w['jira_id']:<20} {w['project']:<16} "
             f"{w['recall@10']:>6.4f}  {w['recall@50']:>6.4f}  "
-            f"{w['map']:>6.4f}  {w['n_candidates']:>6}  {w['n_positives']:>4}"
+            f"{w['mrr']:>6.4f}  {w['map']:>6.4f}  "
+            f"{w['n_candidates']:>6}  {w['n_positives']:>4}"
         )
 
     print(f"\nFull report saved to: {output_path}\n")

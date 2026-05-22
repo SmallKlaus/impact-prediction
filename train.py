@@ -12,13 +12,14 @@ Training schedule:
                                 New layers keep lr_head.
 
 Evaluation metrics (computed each epoch on validation set):
-  - Recall@k for k in [5, 10, 20, 50]
+  - Recall@k for k in [5, 10, 20, 50, 80, 100]
   - NDCG@k   for k in [5, 10, 20]
-  - MAP
+  - MAP, MRR
   - AUC-ROC, F1@0.5 (for completeness)
 
-Recall@k and NDCG@k are the primary metrics since the downstream task is
-ranking classes by impact probability — classification metrics are secondary.
+Recall@50 is the primary early-stopping metric: it directly measures how
+much headroom the bi-encoder leaves for a cross-encoder reranker operating
+on a top-50 shortlist.
 
 Usage:
     python train.py --config config.json
@@ -147,11 +148,20 @@ def average_precision(scores: list[float], labels: list[int]) -> float:
     return ap / n_pos if n_pos else 0.0
 
 
+def mean_reciprocal_rank(scores: list[float], labels: list[int]) -> float:
+    """MRR: reciprocal rank of the first positive in the ranked list."""
+    ranked = sorted(zip(scores, labels), key=lambda x: -x[0])
+    for i, (_, lbl) in enumerate(ranked):
+        if lbl:
+            return 1.0 / (i + 1)
+    return 0.0
+
+
 def compute_ranking_metrics(
     all_scores: list[float],
     all_labels: list[int],
     all_jira_ids: list[str],
-    ks: list[int] = [5, 10, 20, 50],
+    ks: list[int] = [5, 10, 20, 50, 80, 100],
 ) -> dict:
     """
     Compute per-issue ranking metrics, then macro-average across issues.
@@ -170,6 +180,7 @@ def compute_ranking_metrics(
     metrics: dict[str, list] = {f"recall@{k}": [] for k in ks}
     metrics.update({f"ndcg@{k}": [] for k in ks if k <= 20})
     metrics["map"] = []
+    metrics["mrr"] = []
 
     for jid in issue_scores:
         s = issue_scores[jid]
@@ -182,6 +193,7 @@ def compute_ranking_metrics(
             if k <= 20:
                 metrics[f"ndcg@{k}"].append(ndcg_at_k(s, l, k))
         metrics["map"].append(average_precision(s, l))
+        metrics["mrr"].append(mean_reciprocal_rank(s, l))
 
     return {k: (sum(v) / len(v) if v else 0.0) for k, v in metrics.items()}
 
@@ -209,6 +221,7 @@ def evaluate(
     loader:     DataLoader,
     loss_fn:    CombinedLoss,
     device:     torch.device,
+    desc:       str = "Validating",
 ) -> dict:
     model.eval()
 
@@ -216,7 +229,7 @@ def evaluate(
     total_loss = 0.0
     n_batches  = 0
 
-    for batch in loader:
+    for batch in tqdm(loader, desc=desc, leave=False):
         batch = batch.to(device)
 
         logits, f_proj, c_proj = model(
@@ -320,8 +333,16 @@ def _maybe_mine_hard_negatives(
     model:        ImpactScoreModel,
     device:       torch.device,
     initial_hn_counts: dict[str, int],
+    current_r50:  float,
+    hnm_state:    dict,
 ) -> DataLoader:
     """Run one mining pass at the *start* of `epoch` if conditions are met.
+
+    Two-gate design:
+      1. Floor guard  — never mine before `start_epoch` regardless of metrics.
+      2. Threshold gate — wait until val R@50 >= `hnm_threshold`.  Once crossed
+         for the first time, subsequent cadence uses `mine_every_n_epochs`
+         measured from that first-mine epoch.
 
     Returns the (possibly rebuilt) train_loader.
     """
@@ -329,19 +350,46 @@ def _maybe_mine_hard_negatives(
         return train_loader
 
     start_epoch = int(hnm_cfg.get("start_epoch", 2))
-    mine_every = int(hnm_cfg.get("mine_every_n_epochs", 1))
-    epochs_since = epoch - start_epoch
+    mine_every  = int(hnm_cfg.get("mine_every_n_epochs", 1))
+    threshold   = float(hnm_cfg.get("hnm_threshold", 0.0))
 
+    # ── Gate 1: floor guard ───────────────────────────────────────────────────
     if epoch < start_epoch:
-        return train_loader
-
-    if epochs_since % mine_every != 0:
         log.info(
-            "Epoch %d: skipping mining (only runs every %d epochs, next at epoch %d).",
-            epoch, mine_every, epoch + (mine_every - epochs_since % mine_every)
+            "Epoch %d: HNM floor guard — waiting for epoch %d.",
+            epoch, start_epoch,
         )
         return train_loader
 
+    # ── Gate 2: metric threshold ──────────────────────────────────────────────
+    if not hnm_state["unlocked"]:
+        if current_r50 < threshold:
+            log.info(
+                "Epoch %d: HNM threshold not met — val R@50=%.4f < %.4f (threshold). "
+                "Continuing with current negatives.",
+                epoch, current_r50, threshold,
+            )
+            return train_loader
+        # Threshold crossed for the first time
+        hnm_state["unlocked"]    = True
+        hnm_state["first_epoch"] = epoch
+        log.info(
+            "Epoch %d: HNM threshold reached — val R@50=%.4f >= %.4f. "
+            "Hard-negative mining unlocked.",
+            epoch, current_r50, threshold,
+        )
+
+    # ── Cadence check ─────────────────────────────────────────────────────────
+    epochs_since = epoch - hnm_state["first_epoch"]
+    if epochs_since % mine_every != 0:
+        next_mine = epoch + (mine_every - epochs_since % mine_every)
+        log.info(
+            "Epoch %d: skipping mining (only runs every %d epochs, next at epoch %d).",
+            epoch, mine_every, next_mine,
+        )
+        return train_loader
+
+    # ── Mine ──────────────────────────────────────────────────────────────────
     train_ds = train_loader.dataset
     jira_ids = train_ds.training_jira_ids()
 
@@ -414,9 +462,10 @@ def train(config: dict):
     if hnm_cfg.get("enabled", False):
         train_jids = set(train_loader.dataset.training_jira_ids())
         log.info(
-            "Hard-negative mining ENABLED — start_epoch=%d, top_k_per_issue=%s, "
-            "embed_batch_size=%d",
+            "Hard-negative mining ENABLED — start_epoch=%d, hnm_threshold=%.4f, "
+            "top_k_per_issue=%s, embed_batch_size=%d",
             int(hnm_cfg.get("start_epoch", 2)),
+            float(hnm_cfg.get("hnm_threshold", 0.0)),
             hnm_cfg.get("top_k_per_issue"),
             int(hnm_cfg.get("embed_batch_size", 64)),
         )
@@ -447,10 +496,12 @@ def train(config: dict):
     scheduler   = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=1e-6)
 
     # ── Training state ────────────────────────────────────────────────────────
-    best_recall_at_10 = 0.0
+    best_recall_at_50 = 0.0
     patience_counter  = 0
     global_step       = 0
     unfrozen          = False
+    current_r50       = 0.0          # val R@50 from previous epoch (gates HNM)
+    hnm_state         = {"unlocked": False, "first_epoch": None}
 
     log.info("Starting training for %d epochs (warmup=%d, unfreeze_epoch=%d) ...",
              tcfg["total_epochs"], tcfg["warmup_epochs"], tcfg["unfreeze_epoch"])
@@ -470,6 +521,8 @@ def train(config: dict):
                 model              = model,
                 device             = device,
                 initial_hn_counts  = initial_hn_counts,
+                current_r50        = current_r50,
+                hnm_state          = hnm_state,
             )
             new_n_batches = len(train_loader)
             if new_n_batches != prev_n_batches:
@@ -554,13 +607,15 @@ def train(config: dict):
 
         log.info(
             "Epoch %d/%d  train_loss=%.4f  val_loss=%.4f  "
-            "R@10=%.4f  R@20=%.4f  NDCG@10=%.4f  MAP=%.4f",
+            "R@10=%.4f  R@50=%.4f  R@100=%.4f  NDCG@10=%.4f  MAP=%.4f  MRR=%.4f",
             epoch, tcfg["total_epochs"],
             avg_train_loss, metrics["val_loss"],
-            metrics.get("recall@10", 0),
-            metrics.get("recall@20", 0),
-            metrics.get("ndcg@10", 0),
-            metrics.get("map", 0),
+            metrics.get("recall@10",  0),
+            metrics.get("recall@50",  0),
+            metrics.get("recall@100", 0),
+            metrics.get("ndcg@10",    0),
+            metrics.get("map",        0),
+            metrics.get("mrr",        0),
         )
 
         # Save checkpoint
@@ -573,18 +628,19 @@ def train(config: dict):
             "metrics":        metrics,
         }, ckpt_path)
 
-        # Best model tracking (primary metric: Recall@10)
-        r10 = metrics.get("recall@10", 0.0)
-        if r10 > best_recall_at_10:
-            best_recall_at_10 = r10
+        # Best model tracking (primary metric: Recall@50 — directly relevant to
+        # the cross-encoder reranker decision: how much headroom does top-50 leave?)
+        current_r50 = metrics.get("recall@50", 0.0)
+        if current_r50 > best_recall_at_50:
+            best_recall_at_50 = current_r50
             patience_counter  = 0
             best_path = output_dir / "best_model.pt"
             torch.save(model.state_dict(), best_path)
-            log.info("  -> New best Recall@10=%.4f  saved to %s", r10, best_path)
+            log.info("  -> New best Recall@50=%.4f  saved to %s", current_r50, best_path)
         else:
             patience_counter += 1
             log.info(
-                "  -> No improvement (patience %d/%d)",
+                "  -> No improvement in R@50 (patience %d/%d)",
                 patience_counter, tcfg["patience"],
             )
             if patience_counter >= tcfg["patience"]:
@@ -597,7 +653,7 @@ def train(config: dict):
             f.write(json.dumps({"epoch": epoch, "train_loss": avg_train_loss,
                                 **metrics}) + "\n")
 
-    log.info("Training complete. Best Recall@10: %.4f", best_recall_at_10)
+    log.info("Training complete. Best Recall@50: %.4f", best_recall_at_50)
 
     # ── Final test evaluation ─────────────────────────────────────────────────
     # Runs automatically if "test_jsonl" is present in config.
@@ -637,18 +693,21 @@ def train(config: dict):
             )
             log.info("Test samples: %d", len(test_ds))
  
-            test_metrics = evaluate(model, test_loader, loss_fn, device)
+            test_metrics = evaluate(model, test_loader, loss_fn, device, desc="Testing")
  
             log.info(
                 "TEST  val_loss=%.4f  R@5=%.4f  R@10=%.4f  R@20=%.4f  R@50=%.4f  "
-                "NDCG@10=%.4f  MAP=%.4f  AUC=%.4f",
+                "R@80=%.4f  R@100=%.4f  NDCG@10=%.4f  MAP=%.4f  MRR=%.4f  AUC=%.4f",
                 test_metrics["val_loss"],
-                test_metrics.get("recall@5",  0),
-                test_metrics.get("recall@10", 0),
-                test_metrics.get("recall@20", 0),
-                test_metrics.get("recall@50", 0),
-                test_metrics.get("ndcg@10",   0),
+                test_metrics.get("recall@5",   0),
+                test_metrics.get("recall@10",  0),
+                test_metrics.get("recall@20",  0),
+                test_metrics.get("recall@50",  0),
+                test_metrics.get("recall@80",  0),
+                test_metrics.get("recall@100", 0),
+                test_metrics.get("ndcg@10",    0),
                 test_metrics.get("map",        0),
+                test_metrics.get("mrr",        0),
                 test_metrics.get("auc_roc",    0),
             )
  
@@ -659,7 +718,7 @@ def train(config: dict):
                     {
                         "checkpoint": str(best_path),
                         "test_jsonl": test_path,
-                        "best_val_recall@10": best_recall_at_10,
+                        "best_val_recall@50": best_recall_at_50,
                         **{f"test_{k}": v for k, v in test_metrics.items()},
                     },
                     f, indent=2,
