@@ -1,6 +1,6 @@
 {
       "train_jsonl":        "/data1/amine/IMPACT_TRAINING_SAMPLES/SAMPLES_V3/train.jsonl",
-      "val_jsonl":          "/data1/amine/IMPACT_TRAINING_SAMPLES/SAMPLES_V3/val_500.jsonl",
+      "val_jsonl":          "/data1/amine/IMPACT_TRAINING_SAMPLES/SAMPLES_V3/val.jsonl",
       "test_jsonl":         "/data1/amine/IMPACT_TRAINING_SAMPLES/SAMPLES_V3/test_full.jsonl",
       "output_dir":         "/data1/amine/checkpoints/run_008",
       "model": {
@@ -21,7 +21,7 @@
       "training": {
         "batch_size":         16,
         "warmup_epochs":      2,
-        "total_epochs":       10,
+        "total_epochs":       12,
         "unfreeze_epoch":     3,
         "n_unfreeze_layers":  2,
         "lr_head":            1e-4,
@@ -39,10 +39,10 @@
       "hard_negative_mining": {
         "enabled":          true,
         "train_full_jsonl": "/data1/amine/IMPACT_TRAINING_SAMPLES/SAMPLES_V3/train_1000.jsonl",
-        "start_epoch":      2,
+        "start_epoch":      6,
         "hnm_threshold":    0.7,
         "top_k_per_issue":  null,
         "embed_batch_size": 256,
-        "mine_every_n_epochs": 2
+        "mine_every_n_epochs": 3
       }
     }

@@ -335,7 +335,7 @@ def _maybe_mine_hard_negatives(
     initial_hn_counts: dict[str, int],
     current_r50:  float,
     hnm_state:    dict,
-) -> DataLoader:
+) -> tuple[DataLoader, bool]:
     """Run one mining pass at the *start* of `epoch` if conditions are met.
 
     Two-gate design:
@@ -344,10 +344,11 @@ def _maybe_mine_hard_negatives(
          for the first time, subsequent cadence uses `mine_every_n_epochs`
          measured from that first-mine epoch.
 
-    Returns the (possibly rebuilt) train_loader.
+    Returns (train_loader, mined) where `mined=True` signals that a mining
+    round actually ran this epoch (caller should reset patience counter).
     """
     if miner is None:
-        return train_loader
+        return train_loader, False
 
     start_epoch = int(hnm_cfg.get("start_epoch", 2))
     mine_every  = int(hnm_cfg.get("mine_every_n_epochs", 1))
@@ -359,7 +360,7 @@ def _maybe_mine_hard_negatives(
             "Epoch %d: HNM floor guard — waiting for epoch %d.",
             epoch, start_epoch,
         )
-        return train_loader
+        return train_loader, False
 
     # ── Gate 2: metric threshold ──────────────────────────────────────────────
     if not hnm_state["unlocked"]:
@@ -369,7 +370,7 @@ def _maybe_mine_hard_negatives(
                 "Continuing with current negatives.",
                 epoch, current_r50, threshold,
             )
-            return train_loader
+            return train_loader, False
         # Threshold crossed for the first time
         hnm_state["unlocked"]    = True
         hnm_state["first_epoch"] = epoch
@@ -387,7 +388,7 @@ def _maybe_mine_hard_negatives(
             "Epoch %d: skipping mining (only runs every %d epochs, next at epoch %d).",
             epoch, mine_every, next_mine,
         )
-        return train_loader
+        return train_loader, False
 
     # ── Mine ──────────────────────────────────────────────────────────────────
     train_ds = train_loader.dataset
@@ -417,7 +418,7 @@ def _maybe_mine_hard_negatives(
         epoch, n_hn, len(train_ds),
     )
 
-    return _rebuild_train_loader(train_loader)
+    return _rebuild_train_loader(train_loader), True
 
 
 # ── Training loop ─────────────────────────────────────────────────────────────
@@ -513,7 +514,7 @@ def train(config: dict):
         # `start_epoch` onwards we replace them with model-mined ones.
         if miner is not None:
             prev_n_batches = len(train_loader)
-            train_loader = _maybe_mine_hard_negatives(
+            train_loader, mined_this_epoch = _maybe_mine_hard_negatives(
                 epoch              = epoch,
                 miner              = miner,
                 hnm_cfg            = hnm_cfg,
@@ -524,6 +525,12 @@ def train(config: dict):
                 current_r50        = current_r50,
                 hnm_state          = hnm_state,
             )
+            if mined_this_epoch:
+                # Mining is a distribution shift — reset patience so the model
+                # gets a full window to adapt to the new negatives before
+                # early stopping can fire.
+                patience_counter = 0
+                log.info("Epoch %d: patience counter reset after mining round.", epoch)
             new_n_batches = len(train_loader)
             if new_n_batches != prev_n_batches:
                 # Dataset size can shift slightly if some issues lose candidates.
@@ -533,6 +540,17 @@ def train(config: dict):
                 scheduler = CosineAnnealingLR(
                     optimizer, T_max=max(remaining_steps, 1), eta_min=1e-6
                 )
+
+            if hnm_state["unlocked"] and hnm_state["first_epoch"] is not None:
+                epochs_since = epoch - hnm_state["first_epoch"]
+                mine_every   = int(hnm_cfg.get("mine_every_n_epochs", 1))
+                if epochs_since % mine_every == 0:
+                    patience_counter = 0
+                    log.info(
+                        "Epoch %d: patience counter reset after mining round "
+                        "— model needs a fair window to learn new negatives.",
+                        epoch,
+                    )
 
         # ── Unfreeze backbone after warmup ────────────────────────────────────
         if epoch == tcfg["unfreeze_epoch"] and not unfrozen:
