@@ -514,6 +514,8 @@ def train(config: dict):
         # `start_epoch` onwards we replace them with model-mined ones.
         if miner is not None:
             prev_n_batches = len(train_loader)
+            torch.cuda.empty_cache()  # free GPU memory before mining, which can be heavy
+            log.info("Cleared CUDA cache before mining.")
             train_loader, mined_this_epoch = _maybe_mine_hard_negatives(
                 epoch              = epoch,
                 miner              = miner,

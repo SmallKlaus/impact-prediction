@@ -39,11 +39,11 @@
       "hard_negative_mining": {
         "enabled":          true,
         "train_full_jsonl": "/data1/amine/IMPACT_TRAINING_SAMPLES/SAMPLES_V3/train_1000.jsonl",
-        "start_epoch":      6,
+        "start_epoch":      4,
         "hnm_threshold":    0.65,
         "top_k_per_issue":  null,
         "embed_batch_size": 256,
-        "mine_every_n_epochs": 3,
+        "mine_every_n_epochs": 5,
         "reset_lr_after_mining": false,
         "lr_reset_fraction": 0.5
       }
