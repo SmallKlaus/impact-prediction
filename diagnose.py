@@ -95,15 +95,19 @@ def mean_reciprocal_rank(scores: list, labels: list) -> float:
 
 
 def project_of(jira_id: str) -> str:
-    """Infer project name from Jira ID prefix."""
+    """Infer project name from Jira ID prefix.
+
+    Hadoop subprojects (HADOOP/HDFS/MAPREDUCE/YARN) live in a single repository
+    and are collapsed into one "hadoop" bucket for aggregation purposes.
+    """
     prefix = jira_id.split("-")[0].upper()
     mapping = {
         "FLINK":     "flink",
         "KAFKA":     "kafka",
-        "HADOOP":    "hadoop_common",
-        "HDFS":      "hdfs",
-        "MAPREDUCE": "mapreduce",
-        "YARN":      "yarn",
+        "HADOOP":    "hadoop",
+        "HDFS":      "hadoop",
+        "MAPREDUCE": "hadoop",
+        "YARN":      "hadoop",
     }
     return mapping.get(prefix, prefix.lower())
 
@@ -121,6 +125,27 @@ def aggregate(values: list[float]) -> dict:
         "max":  round(max(values), 4),
         "std":  round(std, 4),
         "n":    n,
+    }
+
+
+def recall_distribution(values: list[float]) -> dict:
+    """Bucketed distribution of a recall@k column across issues."""
+    n = len(values)
+    if n == 0:
+        return {
+            "eq_0": 0, "lt_0.5": 0, "gte_0.5": 0, "eq_1": 0,
+            "mean": 0.0, "std": 0.0, "n": 0,
+        }
+    mean = sum(values) / n
+    std  = math.sqrt(sum((v - mean) ** 2 for v in values) / n)
+    return {
+        "eq_0":    sum(1 for v in values if v == 0.0),
+        "lt_0.5":  sum(1 for v in values if 0.0 < v < 0.5),
+        "gte_0.5": sum(1 for v in values if 0.5 <= v < 1.0),
+        "eq_1":    sum(1 for v in values if v == 1.0),
+        "mean":    round(mean, 4),
+        "std":     round(std, 4),
+        "n":       n,
     }
 
 
@@ -218,20 +243,33 @@ def diagnose(
     )
 
     # ── Group by issue ────────────────────────────────────────────────────────
+    log.info("Grouping %d predictions by issue ...", len(all_scores))
     issue_scores:  dict[str, list] = defaultdict(list)
     issue_labels:  dict[str, list] = defaultdict(list)
 
-    for score, label, jid in zip(all_scores, all_labels, all_jira_ids):
+    for score, label, jid in tqdm(
+        zip(all_scores, all_labels, all_jira_ids),
+        total=len(all_scores),
+        desc="Group by issue",
+        leave=True,
+    ):
         issue_scores[jid].append(score)
         issue_labels[jid].append(label)
+    log.info("  → %d distinct issues seen", len(issue_scores))
 
-    KS = [5, 10, 20, 50, 80, 100]
+    KS         = [5, 10, 20, 50, 80, 100]
+    KS_DIST    = [10, 20, 50, 80, 100]   # k's for which we report a distribution
+    KS_NDCG    = [k for k in KS if k <= 20]
 
     # ── Per-issue metrics ─────────────────────────────────────────────────────
+    log.info("Computing per-issue metrics (recall@%s, ndcg@%s, map, mrr) ...",
+             KS, KS_NDCG)
     per_issue: dict[str, dict] = {}
-    for jid in issue_scores:
+    n_skipped = 0
+    for jid in tqdm(list(issue_scores.keys()), desc="Per-issue metrics", leave=True):
         s, l = issue_scores[jid], issue_labels[jid]
         if not any(l):
+            n_skipped += 1
             continue
         entry = {
             "project":      project_of(jid),
@@ -242,20 +280,23 @@ def diagnose(
         }
         for k in KS:
             entry[f"recall@{k}"]  = round(recall_at_k(s, l, k), 4)
-        for k in KS:
-            if k <= 20:
-                entry[f"ndcg@{k}"] = round(ndcg_at_k(s, l, k), 4)
+        for k in KS_NDCG:
+            entry[f"ndcg@{k}"] = round(ndcg_at_k(s, l, k), 4)
         per_issue[jid] = entry
 
-    log.info("Computed metrics for %d issues", len(per_issue))
+    log.info("Computed metrics for %d issues (skipped %d with no positives)",
+             len(per_issue), n_skipped)
 
     # ── Per-project aggregates ────────────────────────────────────────────────
     project_issues: dict[str, list[str]] = defaultdict(list)
     for jid, entry in per_issue.items():
         project_issues[entry["project"]].append(jid)
+    log.info("Aggregating across %d projects: %s",
+             len(project_issues), sorted(project_issues.keys()))
 
     per_project: dict[str, dict] = {}
-    for proj, jids in sorted(project_issues.items()):
+    for proj, jids in tqdm(sorted(project_issues.items()),
+                           desc="Per-project aggregates", leave=True):
         proj_entries = [per_issue[j] for j in jids]
         per_project[proj] = {
             "n_issues": len(jids),
@@ -267,6 +308,7 @@ def diagnose(
         }
 
     # ── Global aggregate ──────────────────────────────────────────────────────
+    log.info("Computing global aggregates ...")
     all_entries = list(per_issue.values())
     global_metrics = {
         "n_issues": len(all_entries),
@@ -275,25 +317,20 @@ def diagnose(
            for k in KS},
         **{f"ndcg@{k}": round(sum(e[f"ndcg@{k}"] for e in all_entries)
                                / len(all_entries), 4)
-           for k in [k for k in KS if k <= 20]},
+           for k in KS_NDCG},
         "map": round(sum(e["map"] for e in all_entries) / len(all_entries), 4),
         "mrr": round(sum(e["mrr"] for e in all_entries) / len(all_entries), 4),
     }
 
-    # ── R@10 distribution ─────────────────────────────────────────────────────
-    r10_values = [e["recall@10"] for e in all_entries]
-    distribution = {
-        "r10_eq_0":        sum(1 for v in r10_values if v == 0.0),
-        "r10_lt_0.5":      sum(1 for v in r10_values if 0.0 < v < 0.5),
-        "r10_gte_0.5":     sum(1 for v in r10_values if 0.5 <= v < 1.0),
-        "r10_eq_1":        sum(1 for v in r10_values if v == 1.0),
-        "r10_mean":        round(sum(r10_values) / len(r10_values), 4),
-        "r10_std":         round(math.sqrt(
-                               sum((v - sum(r10_values)/len(r10_values))**2
-                                   for v in r10_values) / len(r10_values)), 4),
-    }
+    # ── Recall distributions (R@10, R@20, R@50, R@80, R@100) ──────────────────
+    log.info("Computing recall distributions for k=%s ...", KS_DIST)
+    distribution: dict[str, dict] = {}
+    for k in KS_DIST:
+        values = [e[f"recall@{k}"] for e in all_entries]
+        distribution[f"recall@{k}"] = recall_distribution(values)
 
     # ── Worst-N issues ────────────────────────────────────────────────────────
+    log.info("Selecting worst %d issues by recall@10 ...", worst_n)
     worst = sorted(per_issue.items(), key=lambda x: x[1]["recall@10"])[:worst_n]
     worst_issues = [
         {
@@ -321,8 +358,11 @@ def diagnose(
     }
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    log.info("Writing report to %s ...", output_path)
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
+    log.info("  → wrote %d issues, %d projects, %d distributions",
+             len(per_issue), len(per_project), len(distribution))
 
     # ── Print summary ─────────────────────────────────────────────────────────
     print("\n" + "=" * 70)
@@ -335,15 +375,23 @@ def diagnose(
     print(f"  MAP              : {global_metrics['map']:.4f}")
     print(f"  MRR              : {global_metrics['mrr']:.4f}")
 
-    print("\n" + "=" * 70)
-    print("R@10 DISTRIBUTION")
-    print("=" * 70)
+    print("\n" + "=" * 78)
+    print("RECALL DISTRIBUTIONS")
+    print("=" * 78)
     n = len(all_entries)
-    print(f"  R@10 = 0.0       : {distribution['r10_eq_0']:4d}  ({100*distribution['r10_eq_0']/n:.1f}%)")
-    print(f"  R@10 in (0, 0.5) : {distribution['r10_lt_0.5']:4d}  ({100*distribution['r10_lt_0.5']/n:.1f}%)")
-    print(f"  R@10 in [0.5, 1) : {distribution['r10_gte_0.5']:4d}  ({100*distribution['r10_gte_0.5']/n:.1f}%)")
-    print(f"  R@10 = 1.0       : {distribution['r10_eq_1']:4d}  ({100*distribution['r10_eq_1']/n:.1f}%)")
-    print(f"  Mean / Std       : {distribution['r10_mean']:.4f} / {distribution['r10_std']:.4f}")
+    print(f"  {'k':>5} | {'=0':>10}  {'(0,0.5)':>10}  {'[0.5,1)':>10}  {'=1':>10}  "
+          f"{'mean':>6}  {'std':>6}")
+    print("  " + "-" * 74)
+    for k in KS_DIST:
+        d = distribution[f"recall@{k}"]
+        print(
+            f"  R@{k:<3} | "
+            f"{d['eq_0']:>4d} ({100*d['eq_0']/n:>4.1f}%)  "
+            f"{d['lt_0.5']:>4d} ({100*d['lt_0.5']/n:>4.1f}%)  "
+            f"{d['gte_0.5']:>4d} ({100*d['gte_0.5']/n:>4.1f}%)  "
+            f"{d['eq_1']:>4d} ({100*d['eq_1']/n:>4.1f}%)  "
+            f"{d['mean']:>6.4f}  {d['std']:>6.4f}"
+        )
 
     print("\n" + "=" * 85)
     print("PER-PROJECT SUMMARY  (macro-avg R@50 across issues)")
