@@ -1,0 +1,35 @@
+{
+  "ce_train_jsonl":        "/data1/amine/IMPACT_TRAINING_SAMPLES/CE_SAMPLES/ce_train.jsonl",
+  "ce_val_jsonl":          "/data1/amine/IMPACT_TRAINING_SAMPLES/CE_SAMPLES/ce_val.jsonl",
+  "ce_test_jsonl":         "/data1/amine/IMPACT_TRAINING_SAMPLES/CE_SAMPLES/ce_test.jsonl",
+  "output_dir":            "/data1/amine/checkpoints/ce_run_001",
+
+  "biencoder_checkpoint":  "/data1/amine/checkpoints/run_013/best_model.pt",
+
+  "model": {
+    "model_name":          "/data1/amine/unixcoder-base",
+    "dropout":             0.1,
+    "freeze_backbone":     false,
+    "n_unfreeze_layers":   0
+  },
+
+  "loss": {
+    "focal_alpha":         0.85,
+    "focal_gamma":         2.0
+  },
+
+  "training": {
+    "batch_size":          16,
+    "total_epochs":        10,
+    "lr":                  2e-5,
+    "weight_decay":        0.01,
+    "max_grad_norm":       1.0,
+    "max_chunk_tokens":    512,
+    "max_class_tokens":    256,
+    "max_chunks":          4,
+    "num_workers":         4,
+    "patience":            3,
+    "unfreeze_epoch":      null,
+    "n_unfreeze_layers":   0
+  }
+}
