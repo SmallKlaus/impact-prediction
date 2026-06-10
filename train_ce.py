@@ -1,6 +1,6 @@
 """
 train_ce.py — Cross-Encoder Reranker Training
-=============================================
+====
 Trains on top-K candidates produced by build_ce_samples.py. The bi-encoder's
 top-K already contains the hard negatives (false positives the bi-encoder
 ranked highly), so no further mining is needed.
@@ -42,7 +42,7 @@ from transformers import AutoTokenizer
 
 from cross_encoder_model   import CrossEncoder, build_cross_encoder
 from cross_encoder_dataset import (CrossEncoderDataset, CEBatch,
-                                   ce_collate_fn, build_ce_dataloaders)
+                    ce_collate_fn, build_ce_dataloaders)
 from loss import FocalLoss
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -57,7 +57,14 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ── Ranking metrics ────────────────────────────────────────────────────────
+# ── Multi-GPU helper ────
+
+def _unwrap(model: nn.Module) -> nn.Module:
+    """Return the underlying module when wrapped in DataParallel."""
+    return model.module if isinstance(model, nn.DataParallel) else model
+
+
+# ── Ranking metrics ────
 
 def recall_at_k(scores, labels, k):
     if not any(labels): return 0.0
@@ -117,7 +124,7 @@ def compute_ranking_metrics(
     return {k: (sum(v) / len(v) if v else 0.0) for k, v in bucket.items()}
 
 
-# ── Evaluation ─────────────────────────────────────────────────────────────
+# ── Evaluation ────
 
 @torch.no_grad()
 def evaluate(
@@ -160,7 +167,7 @@ def evaluate(
     return ce_metrics, be_metrics
 
 
-# ── Logging helpers ────────────────────────────────────────────────────────
+# ── Logging helpers ────
 
 def _log_class_balance(dataset: CrossEncoderDataset, split: str):
     n_pos = sum(1 for s in dataset.samples if int(s.get("label", 0)) == 1)
@@ -199,22 +206,24 @@ def _log_comparison(epoch: int, total: int,
     )
 
 
-# ── Training loop ──────────────────────────────────────────────────────────
+# ── Training loop ────
 
 def train(config: dict):
     tcfg   = config["training"]
     device = torch.device(
-        "cuda" if torch.cuda.is_available() else
-        "mps"  if torch.backends.mps.is_available() else "cpu"
+        "cuda:0" if torch.cuda.is_available() else
+        "mps"    if torch.backends.mps.is_available() else "cpu"
     )
     log.info("Device: %s", device)
+    n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    log.info("GPUs available: %d", n_gpus)
 
     output_dir = Path(config["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
     with open(output_dir / "config_ce.json", "w") as f:
         json.dump(config, f, indent=2)
 
-    # ── Tokenizer and data ─────────────────────────────────────────────
+    # ── Tokenizer and data ────
     model_name = config["model"]["model_name"]
     log.info("Loading tokenizer: %s", model_name)
     tokenizer  = AutoTokenizer.from_pretrained(model_name)
@@ -233,14 +242,24 @@ def train(config: dict):
     _log_class_balance(train_loader.dataset, "train")
     _log_class_balance(val_loader.dataset,   "val")
 
-    # ── Model and loss ─────────────────────────────────────────────────
+    # ── Model and loss ────
     log.info("Building cross-encoder ...")
     model = build_cross_encoder(
         config               = config["model"],
         biencoder_checkpoint = config.get("biencoder_checkpoint"),
     ).to(device)
 
-    frozen, total_params = model.frozen_param_count()
+    use_multi_gpu = tcfg.get("multi_gpu", True)
+    if use_multi_gpu and n_gpus > 1:
+        gpu_ids = list(range(n_gpus))
+        model   = nn.DataParallel(model, device_ids=gpu_ids)
+        log.info("Wrapped model in DataParallel across GPUs: %s", gpu_ids)
+    elif use_multi_gpu and n_gpus <= 1:
+        log.info("multi_gpu=true but only %d GPU detected — running single-GPU.", n_gpus)
+    else:
+        log.info("multi_gpu=false — single-GPU mode.")
+
+    frozen, total_params = _unwrap(model).frozen_param_count()
     log.info("Backbone params: %d frozen / %d total", frozen, total_params)
 
     lcfg    = config.get("loss", {})
@@ -249,7 +268,7 @@ def train(config: dict):
         gamma = lcfg.get("focal_gamma", 2.0),
     )
 
-    # ── Optimizer and scheduler ────────────────────────────────────────
+    # ── Optimizer and scheduler ────
     optimizer   = AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr           = tcfg["lr"],
@@ -258,7 +277,7 @@ def train(config: dict):
     total_steps = len(train_loader) * tcfg["total_epochs"]
     scheduler   = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=1e-6)
 
-    # ── Training state ─────────────────────────────────────────────────
+    # ── Training state ────
     best_mrr         = 0.0
     patience_counter = 0
     global_step      = 0
@@ -270,12 +289,12 @@ def train(config: dict):
 
     for epoch in range(1, tcfg["total_epochs"] + 1):
 
-        # ── Optional backbone unfreeze ─────────────────────────────────
+        # ── Optional backbone unfreeze ────
         unfreeze_epoch = tcfg.get("unfreeze_epoch")
         if unfreeze_epoch and epoch == unfreeze_epoch and not unfrozen:
             n = tcfg.get("n_unfreeze_layers", 2)
             log.info("Epoch %d: unfreezing top %d backbone layers.", epoch, n)
-            model.unfreeze_top_layers(n)
+            _unwrap(model).unfreeze_top_layers(n)
             unfrozen = True
             optimizer = AdamW(
                 filter(lambda p: p.requires_grad, model.parameters()),
@@ -287,10 +306,10 @@ def train(config: dict):
                 T_max   = len(train_loader) * (tcfg["total_epochs"] - epoch + 1),
                 eta_min = 1e-6,
             )
-            frozen, _ = model.frozen_param_count()
+            frozen, _ = _unwrap(model).frozen_param_count()
             log.info("After unfreeze: %d frozen backbone params", frozen)
 
-        # ── Train epoch ────────────────────────────────────────────────
+        # ── Train epoch ────
         model.train()
         epoch_loss = 0.0
         n_batches  = 0
@@ -307,7 +326,7 @@ def train(config: dict):
             optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(),
-                                     tcfg.get("max_grad_norm", 1.0))
+                    tcfg.get("max_grad_norm", 1.0))
             optimizer.step()
             scheduler.step()
 
@@ -322,16 +341,16 @@ def train(config: dict):
 
         avg_train_loss = epoch_loss / max(n_batches, 1)
 
-        # ── Validation ─────────────────────────────────────────────────
+        # ── Validation ────
         ce_metrics, be_metrics = evaluate(model, val_loader, loss_fn, device)
         _log_comparison(epoch, tcfg["total_epochs"], avg_train_loss,
-                        ce_metrics, be_metrics)
+                    ce_metrics, be_metrics)
 
         # Save checkpoint
         torch.save({
             "epoch":           epoch,
             "global_step":     global_step,
-            "model_state":     model.state_dict(),
+            "model_state":     _unwrap(model).state_dict(),
             "optimizer_state": optimizer.state_dict(),
             "ce_metrics":      ce_metrics,
             "be_metrics":      be_metrics,
@@ -343,13 +362,13 @@ def train(config: dict):
             best_mrr         = current_mrr
             patience_counter = 0
             best_path        = output_dir / "best_model_ce.pt"
-            torch.save(model.state_dict(), best_path)
+            torch.save(_unwrap(model).state_dict(), best_path)
             log.info("  -> New best MRR=%.4f  saved to %s",
-                     current_mrr, best_path)
+                    current_mrr, best_path)
         else:
             patience_counter += 1
             log.info("  -> No improvement in MRR (patience %d/%d)",
-                     patience_counter, tcfg["patience"])
+                    patience_counter, tcfg["patience"])
             if patience_counter >= tcfg["patience"]:
                 log.info("Early stopping triggered.")
                 break
@@ -366,7 +385,7 @@ def train(config: dict):
     log.info("Training complete.  Best MRR: %.4f", best_mrr)
     log.info("=" * 60)
 
-    # ── Final test evaluation ──────────────────────────────────────────
+    # ── Final test evaluation ────
     test_path = config.get("ce_test_jsonl")
     if test_path and Path(test_path).exists():
         best_path = output_dir / "best_model_ce.pt"
@@ -379,7 +398,7 @@ def train(config: dict):
             log.info("Test set   : %s", test_path)
             log.info("=" * 60)
 
-            model.load_state_dict(torch.load(best_path, map_location=device))
+            _unwrap(model).load_state_dict(torch.load(best_path, map_location=device))
 
             test_ds = CrossEncoderDataset(
                 test_path, tokenizer,
@@ -416,7 +435,7 @@ def train(config: dict):
             log.info("Test metrics saved to %s", results_path)
 
 
-# ── Entry point ────────────────────────────────────────────────────────────
+# ── Entry point ────
 
 def main():
     parser = argparse.ArgumentParser(description="Train cross-encoder reranker")

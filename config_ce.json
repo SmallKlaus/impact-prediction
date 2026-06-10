@@ -19,7 +19,8 @@
   },
 
   "training": {
-    "batch_size":          16,
+    "multi_gpu":            true,
+    "batch_size":          8,
     "total_epochs":        10,
     "lr":                  2e-5,
     "weight_decay":        0.01,
