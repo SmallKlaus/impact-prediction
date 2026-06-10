@@ -199,7 +199,7 @@ def build_cross_encoder(
         if "model_state" in state:
             state = state["model_state"]
         encoder_state = {
-            k.removeprefix("encoder."): v
+            k[len("encoder."):] if k.startswith("encoder.") else k: v
             for k, v in state.items()
             if k.startswith("encoder.")
         }
