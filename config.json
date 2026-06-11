@@ -1,12 +1,15 @@
 {
       "train_jsonl":        "/data1/amine/IMPACT_TRAINING_SAMPLES/SAMPLES_V3/train.jsonl",
-      "val_jsonl":          "/data1/amine/IMPACT_TRAINING_SAMPLES/SAMPLES_V3/val_500.jsonl",
+      "val_jsonl":          "/data1/amine/IMPACT_TRAINING_SAMPLES/SAMPLES_V3/val_5.jsonl",
       "test_jsonl":         "/data1/amine/IMPACT_TRAINING_SAMPLES/SAMPLES_V3/test_full.jsonl",
-      "output_dir":         "/data1/amine/checkpoints/run_010",
+      "output_dir":         "/data1/amine/checkpoints/run_015",
       "model": {
         "model_name":         "/data1/amine/unixcoder-base",
         "proj_dim":           256,
-        "interaction_hidden": 256,
+        "interaction_hidden": 512,
+        "interaction_layers": 2,
+        "interaction_activation": "gelu",
+        "interaction_layernorm": true,
         "dropout":            0.1,
         "freeze_backbone":    true,
         "n_unfreeze_layers":  0,

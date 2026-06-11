@@ -78,17 +78,57 @@ class AttentionPool(nn.Module):
 
 class InteractionMLP(nn.Module):
     """
-    Two-layer MLP over the interaction vector [f, c, f-c, f*c].
-    Input dim = 4 * proj_dim.
+    MLP over the InferSent-style interaction vector [f, c, f-c, f*c].
+    Input dimension is always 4 * proj_dim.
+ 
+    Controlled by four config parameters:
+ 
+        interaction_hidden      Width of the first hidden layer.
+                                The second hidden layer (n_layers=2) is always
+                                interaction_hidden // 2.
+ 
+        n_layers                1  →  original single-hidden-layer MLP.
+                                2  →  deeper MLP (H → H//2 → 1).
+ 
+        activation              "relu"  →  original behaviour.
+                                "gelu"  →  smoother, matches UniXcoder internals.
+ 
+        use_layernorm           False  →  original behaviour.
+                                True   →  LayerNorm after each activation.
+ 
+    Dropout is placed immediately before the final linear regardless of depth.
     """
-    def __init__(self, proj_dim: int, hidden_dim: int, dropout: float = 0.1):
+ 
+    def __init__(
+        self,
+        proj_dim:      int,
+        hidden_dim:    int,
+        dropout:       float = 0.1,
+        n_layers:      int   = 1,
+        activation:    str   = "relu",
+        use_layernorm: bool  = False,
+    ):
         super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(4 * proj_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1),
-        )
+ 
+        def act() -> nn.Module:
+            return nn.GELU() if activation == "gelu" else nn.ReLU()
+ 
+        hidden_dims = [hidden_dim] if n_layers == 1 else [hidden_dim, hidden_dim // 2]
+ 
+        layers: list[nn.Module] = []
+        in_dim = 4 * proj_dim
+ 
+        for h_dim in hidden_dims:
+            layers.append(nn.Linear(in_dim, h_dim))
+            layers.append(act())
+            if use_layernorm:
+                layers.append(nn.LayerNorm(h_dim))
+            in_dim = h_dim
+ 
+        layers.append(nn.Dropout(dropout))
+        layers.append(nn.Linear(in_dim, 1))
+ 
+        self.mlp = nn.Sequential(*layers)
 
     def forward(self, f: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
         """
@@ -128,7 +168,10 @@ class ImpactScoreModel(nn.Module):
         self,
         model_name:          str   = "microsoft/unixcoder-base",
         proj_dim:            int   = 256,
-        interaction_hidden:  int   = 256,
+        interaction_hidden:  int   = 512,
+        interaction_layers:  int   = 1,
+        interaction_activation: str   = "relu",
+        interaction_layernorm: bool  = False,
         dropout:             float = 0.1,
         use_attention_pool:  bool  = False,
         freeze_backbone:     bool  = True,
@@ -149,7 +192,14 @@ class ImpactScoreModel(nn.Module):
         self.attn_pool = AttentionPool(proj_dim) if use_attention_pool else None
 
         # Interaction MLP
-        self.interaction = InteractionMLP(proj_dim, interaction_hidden, dropout)
+        self.interaction = InteractionMLP(
+            proj_dim=proj_dim,
+            hidden_dim=interaction_hidden,
+            dropout=dropout,
+            n_layers=interaction_layers,
+            activation=interaction_activation,
+            use_layernorm=interaction_layernorm
+        )
 
         # Apply initial freezing
         self._apply_freeze(freeze_backbone, n_unfreeze_layers)
@@ -326,6 +376,9 @@ def build_model(config: dict) -> ImpactScoreModel:
           "model_name":         "microsoft/unixcoder-base",
           "proj_dim":           256,
           "interaction_hidden": 256,
+          "interaction_layers":     1     ← original
+          "interaction_activation": "relu"← original
+          "interaction_layernorm":  false ← original
           "dropout":            0.1,
           "use_attention_pool": false,
           "freeze_backbone":    true,
@@ -336,6 +389,9 @@ def build_model(config: dict) -> ImpactScoreModel:
         model_name          = config.get("model_name", "microsoft/unixcoder-base"),
         proj_dim            = config.get("proj_dim", 256),
         interaction_hidden  = config.get("interaction_hidden", 256),
+        interaction_layers     = config.get("interaction_layers",     1),
+        interaction_activation = config.get("interaction_activation", "relu"),
+        interaction_layernorm  = config.get("interaction_layernorm",  False),
         dropout             = config.get("dropout", 0.1),
         use_attention_pool  = config.get("use_attention_pool", False),
         freeze_backbone     = config.get("freeze_backbone", True),
