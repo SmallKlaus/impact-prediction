@@ -43,14 +43,14 @@ class SampleBatch:
     is_hard_negative:       list[bool]
     dependency_scores:      list[float]
 
-    def to(self, device: torch.device) -> "SampleBatch":
+    def to(self, device: torch.device, non_blocking: bool = False) -> "SampleBatch":
         return SampleBatch(
-            feature_input_ids      = self.feature_input_ids.to(device),
-            feature_attention_mask = self.feature_attention_mask.to(device),
-            feature_chunk_mask     = self.feature_chunk_mask.to(device),
-            class_input_ids        = self.class_input_ids.to(device),
-            class_attention_mask   = self.class_attention_mask.to(device),
-            labels                 = self.labels.to(device),
+            feature_input_ids      = self.feature_input_ids.to(device, non_blocking=non_blocking),
+            feature_attention_mask = self.feature_attention_mask.to(device, non_blocking=non_blocking),
+            feature_chunk_mask     = self.feature_chunk_mask.to(device, non_blocking=non_blocking),
+            class_input_ids        = self.class_input_ids.to(device, non_blocking=non_blocking),
+            class_attention_mask   = self.class_attention_mask.to(device, non_blocking=non_blocking),
+            labels                 = self.labels.to(device, non_blocking=non_blocking),
             jira_ids               = self.jira_ids,
             class_paths            = self.class_paths,
             is_hard_negative       = self.is_hard_negative,
