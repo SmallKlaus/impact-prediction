@@ -17,6 +17,10 @@ both numbers side-by-side and the improvement is always visible.
 
 Usage:
     python train_ce.py --config config_ce.json
+
+Config note:
+    You can add "cuda_visible_devices" to the JSON config as a list or
+    comma-separated string, for example [1, 2, 3] or "1,2,3".
 """
 
 from __future__ import annotations
@@ -48,6 +52,48 @@ from loss import FocalLoss
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 ssl._create_default_https_context = ssl._create_unverified_context
 os.environ["CURL_CA_BUNDLE"] = ""
+
+
+def _normalize_cuda_visible_devices(value) -> str:
+    """
+    Normalize a config value into a CUDA_VISIBLE_DEVICES string.
+
+    Accepts:
+        - "1,2,3"
+        - [1, 2, 3]
+        - 1
+
+    Returning an empty string is intentional and can be used to force CPU-only
+    execution by hiding all GPUs from PyTorch.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        parts = [part.strip() for part in value.split(",") if part.strip()]
+        return ",".join(parts)
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, (list, tuple)):
+        return ",".join(str(int(v)) for v in value)
+    raise TypeError(
+        "config['cuda_visible_devices'] must be a string, int, list, or tuple"
+    )
+
+
+def _apply_cuda_visible_devices(config: dict) -> Optional[str]:
+    """
+    Apply CUDA visibility from config before any CUDA work starts.
+
+    If the key is omitted, the process environment is left unchanged so the
+    caller can still set CUDA_VISIBLE_DEVICES externally.
+    """
+    if "cuda_visible_devices" not in config:
+        return None
+
+    visible = _normalize_cuda_visible_devices(config.get("cuda_visible_devices"))
+    os.environ["CUDA_VISIBLE_DEVICES"] = visible
+    return visible
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -210,6 +256,13 @@ def _log_comparison(epoch: int, total: int,
 
 def train(config: dict):
     tcfg   = config["training"]
+    visible_devices = _apply_cuda_visible_devices(config)
+    if visible_devices is not None:
+        log.info("CUDA_VISIBLE_DEVICES set from config: %r", visible_devices)
+    else:
+        log.info("CUDA_VISIBLE_DEVICES inherited from environment: %r",
+                 os.environ.get("CUDA_VISIBLE_DEVICES"))
+
     device = torch.device(
         "cuda:0" if torch.cuda.is_available() else
         "mps"    if torch.backends.mps.is_available() else "cpu"

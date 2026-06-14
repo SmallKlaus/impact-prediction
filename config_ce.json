@@ -3,6 +3,7 @@
   "ce_val_jsonl":          "/data1/amine/IMPACT_TRAINING_SAMPLES/CE_SAMPLES/ce_val.jsonl",
   "ce_test_jsonl":         "/data1/amine/IMPACT_TRAINING_SAMPLES/CE_SAMPLES/ce_test.jsonl",
   "output_dir":            "/data1/amine/checkpoints/ce_run_001",
+  "cuda_visible_devices":  [1, 2, 3],
 
   "biencoder_checkpoint":  "/data1/amine/checkpoints/run_013/best_model.pt",
 
