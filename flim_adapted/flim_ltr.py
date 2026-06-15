@@ -27,9 +27,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import (ExtraTreesClassifier, GradientBoostingRegressor,
-                              AdaBoostClassifier)
+                               AdaBoostClassifier)
 from sklearn.feature_selection import chi2, mutual_info_classif, VarianceThreshold
 from sklearn.linear_model import SGDRegressor
+from tqdm import tqdm
 
 from flim_common import FEATURE_COLUMNS, average_precision
 
@@ -39,28 +40,43 @@ logging.basicConfig(level=logging.INFO,
 log = logging.getLogger(__name__)
 
 
+# ── Feature loading ────
+
 def load_features(path: str) -> pd.DataFrame:
+    log.info("Loading features from: %s", path)
     rows = []
     with open(path, encoding="utf-8") as f:
-        for line in f:
+        for line in tqdm(f, desc=f"  Reading {Path(path).name}",
+                         unit=" lines", dynamic_ncols=True):
             line = line.strip()
-            if not line: continue
+            if not line:
+                continue
             r = json.loads(line)
-            rows.append({"jira_id": r["jira_id"], "label": int(r["label"]),
-                         **r["features"]})
+            rows.append({"jira_id": r["jira_id"],
+                          "label":  int(r["label"]),
+                          **r["features"]})
     df = pd.DataFrame(rows)
     for c in FEATURE_COLUMNS:
-        if c not in df: df[c] = 0.0
+        if c not in df:
+            df[c] = 0.0
     df[FEATURE_COLUMNS] = df[FEATURE_COLUMNS].clip(lower=0.0).fillna(0.0)
+    n_pos = int(df["label"].sum())
+    log.info("  Loaded %d rows  |  positives: %d  |  issues: %d",
+             len(df), n_pos, df["jira_id"].nunique())
     return df
 
 
+# ── Macro MAP (validation objective) ────
+
 def macro_map(df: pd.DataFrame, scores: np.ndarray) -> float:
-    d = df[["jira_id", "label"]].copy(); d["score"] = scores
+    d = df[["jira_id", "label"]].copy()
+    d["score"] = scores
     aps = [average_precision(g["score"].tolist(), g["label"].tolist())
            for _, g in d.groupby("jira_id") if g["label"].any()]
     return float(np.mean(aps)) if aps else 0.0
 
+
+# ── Weight normalizer ────
 
 def _norm(w):
     w = np.clip(np.nan_to_num(np.asarray(w, dtype=float)), 0, None)
@@ -68,9 +84,11 @@ def _norm(w):
     return w / s if s > 0 else np.ones_like(w) / len(w)
 
 
+# ── Prescoring weight methods (Fejzer et al.) ────
+
 def weight_methods(seed: int):
-    def w_chi2(X, y):   return _norm(chi2(X, y)[0])
-    def w_mi(X, y):     return _norm(mutual_info_classif(X, y, random_state=seed))
+    def w_chi2(X, y):    return _norm(chi2(X, y)[0])
+    def w_mi(X, y):      return _norm(mutual_info_classif(X, y, random_state=seed))
     def w_extra(X, y):
         m = ExtraTreesClassifier(n_estimators=100, random_state=seed).fit(X, y)
         return _norm(m.feature_importances_)
@@ -83,14 +101,20 @@ def weight_methods(seed: int):
     def w_var(X, y):
         fs = VarianceThreshold().fit(X)
         return _norm(fs.variances_)
-    def w_const(X, y):  return np.ones(X.shape[1]) / X.shape[1]
-    return {"chi2": w_chi2, "mutual_info": w_mi, "extra_trees": w_extra,
-            "gbr_importance": w_gbr, "adaboost": w_ada,
-            "variance": w_var, "const": w_const}
+    def w_const(X, y):   return np.ones(X.shape[1]) / X.shape[1]
+    return {"chi2":            w_chi2,
+            "mutual_info":     w_mi,
+            "extra_trees":     w_extra,
+            "gbr_importance":  w_gbr,
+            "adaboost":        w_ada,
+            "variance":        w_var,
+            "const":           w_const}
 
+
+# ── Cut-set builder (Fejzer's size_selectf) ────
 
 def cut_set(labels: np.ndarray, score: np.ndarray, perc: float) -> np.ndarray:
-    """Positives + lowest-scored slice among score>0 (Fejzer's size_selectf)."""
+    """Positives + lowest-scored slice among score > 0."""
     keep = labels == 1
     pos_scores = score[score > 0]
     if len(pos_scores):
@@ -100,6 +124,8 @@ def cut_set(labels: np.ndarray, score: np.ndarray, perc: float) -> np.ndarray:
     return keep & (score > 0)
 
 
+# ── Main ────
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--train-features", required=True)
@@ -107,42 +133,66 @@ def main():
     ap.add_argument("--config",         required=True)
     ap.add_argument("--output-dir",     required=True)
     args = ap.parse_args()
+
     cfg  = json.load(open(args.config, encoding="utf-8"))["ltr"]
     seed = cfg.get("seed", 123456)
 
     tr  = load_features(args.train_features)
     va  = load_features(args.val_features)
     Xtr, ytr = tr[FEATURE_COLUMNS].values, tr["label"].values
-    Xva      = va[FEATURE_COLUMNS].values
-    log.info("Train rows %d (pos %d) | Val rows %d",
-             len(tr), int(ytr.sum()), len(va))
+    Xva       = va[FEATURE_COLUMNS].values
+    log.info("Feature matrix — train: %s  |  val: %s",
+             Xtr.shape, Xva.shape)
 
     # ── Phase 1: prescoring weight selection ────
-    presc_log, best = [], ("", None, -1.0)
-    for name, fn in weight_methods(seed).items():
+    log.info("=" * 60)
+    log.info("Phase 1 — Prescoring weight methods (%d methods)",
+             len(weight_methods(seed)))
+    log.info("=" * 60)
+    methods   = weight_methods(seed)
+    presc_log = []
+    best      = ("", None, -1.0)
+
+    for name, fn in tqdm(methods.items(),
+                          desc="Prescoring methods",
+                          unit="method", dynamic_ncols=True):
         try:
             w = fn(Xtr, ytr)
         except Exception as e:
-            log.warning("weights %s failed: %s", name, e); continue
+            log.warning("  Weight method '%s' failed: %s", name, e)
+            continue
         m = macro_map(va, Xva @ w)
-        presc_log.append((name, [round(x, 5) for x in w], round(m, 4)))
-        log.info("  prescoring %-16s val MAP %.4f", name, m)
-        if m > best[2]: best = (name, w, m)
+        presc_log.append((name, [round(x, 5) for x in w.tolist()], round(m, 4)))
+        log.info("  %-18s  val MAP = %.4f", name, m)
+        if m > best[2]:
+            best = (name, w, m)
+
     w_name, w_best, w_map = best
-    log.info("Best prescoring: %s (val MAP %.4f)", w_name, w_map)
+    log.info("Best prescoring method: '%s'  (val MAP %.4f)", w_name, w_map)
 
     # ── Phase 2: regression model selection ────
-    score_tr  = Xtr @ w_best
-    target    = score_tr + ytr * score_tr.max()
-    losses    = ["squared_error", "huber", "epsilon_insensitive",
-                 "squared_epsilon_insensitive"]
+    losses    = ["squared_error", "huber",
+                 "epsilon_insensitive", "squared_epsilon_insensitive"]
     penalties = ["l2", "l1", "elasticnet", None]
+    alphas    = cfg.get("alphas",    [1e-4])
+    cut_percs = cfg.get("cut_percs", [0.05, 0.1, 0.15, 0.2, 0.25, 0.3])
+    combos    = list(product(losses, penalties, alphas, cut_percs))
+
+    log.info("=" * 60)
+    log.info("Phase 2 — Regression model selection (%d combinations)",
+             len(combos))
+    log.info("=" * 60)
+
+    score_tr = Xtr @ w_best
+    target   = score_tr + ytr * score_tr.max()
     reg_log, reg_best = [], (None, "", -1.0)
-    for loss, pen, alpha, perc in product(
-            losses, penalties, cfg.get("alphas", [1e-4]),
-            cfg.get("cut_percs", [0.05, 0.1, 0.15, 0.2, 0.25, 0.3])):
+
+    for loss, pen, alpha, perc in tqdm(combos,
+                                        desc="Regression combos",
+                                        unit="combo", dynamic_ncols=True):
         mask = cut_set(ytr, score_tr, perc)
-        if mask.sum() < 10: continue
+        if mask.sum() < 10:
+            continue
         try:
             reg = SGDRegressor(max_iter=1000, shuffle=False, loss=loss,
                                penalty=pen, alpha=alpha, random_state=seed)
@@ -152,27 +202,43 @@ def main():
             continue
         name = f"SGD_{loss}_{pen}_{alpha}_cut{perc}"
         reg_log.append((name, round(m, 4)))
-        if m > reg_best[2]: reg_best = (reg, name, m)
-    log.info("Best regressor : %s (val MAP %.4f)", reg_best[1], reg_best[2])
+        if m > reg_best[2]:
+            reg_best = (reg, name, m)
 
-    # ── Final choice by val MAP ────
-    use_reg = reg_best[2] >= w_map
+    log.info("Best regressor: '%s'  (val MAP %.4f)", reg_best[1], reg_best[2])
+
+    # ── Final model selection by val MAP ────
+    use_reg  = reg_best[2] >= w_map
+    chosen   = "regressor" if use_reg else "weights"
+    log.info("=" * 60)
+    log.info("Final choice: '%s'  (regressor MAP %.4f vs weights MAP %.4f)",
+             chosen, reg_best[2], w_map)
+    log.info("=" * 60)
+
     artifact = {
-        "feature_columns": FEATURE_COLUMNS,
-        "type": "regressor" if use_reg else "weights",
-        "weights": w_best, "weights_name": w_name, "weights_val_map": w_map,
-        "regressor": reg_best[0], "regressor_name": reg_best[1],
+        "feature_columns":   FEATURE_COLUMNS,
+        "type":              chosen,
+        "weights":           w_best,
+        "weights_name":      w_name,
+        "weights_val_map":   w_map,
+        "regressor":         reg_best[0],
+        "regressor_name":    reg_best[1],
         "regressor_val_map": reg_best[2],
     }
-    out = Path(args.output_dir); out.mkdir(parents=True, exist_ok=True)
+
+    out = Path(args.output_dir)
+    out.mkdir(parents=True, exist_ok=True)
     with open(out / "flim_ltr.pkl", "wb") as f:
         pickle.dump(artifact, f)
-    json.dump({"chosen": artifact["type"],
-               "prescoring_log": presc_log, "regression_log": reg_log,
+    json.dump({"chosen":           artifact["type"],
+               "prescoring_log":  presc_log,
+               "regression_log":  reg_log,
                "best_prescoring": [w_name, w_map],
                "best_regression": [reg_best[1], reg_best[2]]},
               open(out / "flim_ltr_report.json", "w"), indent=2)
-    log.info("Saved %s (chosen: %s)", out / "flim_ltr.pkl", artifact["type"])
+
+    log.info("Artifact saved → %s", out / "flim_ltr.pkl")
+    log.info("LTR report   → %s", out / "flim_ltr_report.json")
 
 
 if __name__ == "__main__":

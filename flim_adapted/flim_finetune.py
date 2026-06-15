@@ -37,6 +37,8 @@ logging.basicConfig(level=logging.INFO,
 log = logging.getLogger(__name__)
 
 
+# ── Dataset ────
+
 class PairDataset(Dataset):
     def __init__(self, pairs, tokenizer, nl_len, code_len):
         self.pairs, self.tok = pairs, tokenizer
@@ -50,29 +52,41 @@ class PairDataset(Dataset):
                      padding="max_length", return_tensors="pt")
         c = self.tok(code, max_length=self.code_len, truncation=True,
                      padding="max_length", return_tensors="pt")
-        return {"nl_ids":   n["input_ids"].squeeze(0),
-                "nl_mask":  n["attention_mask"].squeeze(0),
-                "code_ids": c["input_ids"].squeeze(0),
+        return {"nl_ids":    n["input_ids"].squeeze(0),
+                "nl_mask":   n["attention_mask"].squeeze(0),
+                "code_ids":  c["input_ids"].squeeze(0),
                 "code_mask": c["attention_mask"].squeeze(0)}
 
 
+# ── Pair builder ────
+
 def build_pairs(train_jsonl: Path, func_cfg: dict, max_pairs_per_file: int):
     by_issue = load_jsonl_by_issue(train_jsonl)
+    log.info("Loaded %d issues from %s", len(by_issue), train_jsonl)
     pairs, seen = [], set()
-    for jid, recs in by_issue.items():
+    for jid, recs in tqdm(by_issue.items(),
+                           desc="Building (feature, function) pairs",
+                           unit="issue", dynamic_ncols=True):
         feat = next((r.get("feature_text", "") for r in recs
                      if r.get("feature_text")), "")
-        if not feat: continue
+        if not feat:
+            continue
         for r in recs:
-            if int(r.get("label", 0)) != 1: continue
+            if int(r.get("label", 0)) != 1:
+                continue
             key = (jid, r.get("class_path", ""))
-            if key in seen: continue
+            if key in seen:
+                continue
             seen.add(key)
             funcs = extract_functions(r.get("class_text", ""), func_cfg)
             for fn in funcs[:max_pairs_per_file]:
                 pairs.append((feat, fn))
+    log.info("Built %d fine-tuning pairs  |  unique (issue, file) anchors: %d",
+             len(pairs), len(seen))
     return pairs
 
+
+# ── Embedding helper ────
 
 @torch.no_grad()
 def embed_texts(model, tok, texts, device, max_len, bs=256):
@@ -85,6 +99,8 @@ def embed_texts(model, tok, texts, device, max_len, bs=256):
     return torch.cat(out) if out else torch.empty(0)
 
 
+# ── Validation ────
+
 @torch.no_grad()
 def file_level_eval(model, tok, val_issues, cfg, device):
     """FLIM semantic score (max over functions of max over query chunks)."""
@@ -95,31 +111,41 @@ def file_level_eval(model, tok, val_issues, cfg, device):
 
     items = list(val_issues.items())
     rng.shuffle(items)
-    for jid, recs in items[: ft.get("val_max_issues", 50)]:
+    eval_items = items[: ft.get("val_max_issues", 50)]
+    log.info("Running file-level eval on %d sampled val issues", len(eval_items))
+
+    for jid, recs in tqdm(eval_items,
+                           desc="  Val eval",
+                           unit="issue", leave=False, dynamic_ncols=True):
         pos = [r for r in recs if int(r.get("label", 0)) == 1]
         neg = [r for r in recs if int(r.get("label", 0)) == 0]
-        if not pos: continue
+        if not pos:
+            continue
         k_neg = max(0, ft.get("val_max_candidates", 100) - len(pos))
         cands = pos + rng.sample(neg, min(k_neg, len(neg)))
 
         r0     = recs[0]
-        chunks = [c.get("text", "") for c in r0.get("feature_chunks", [])] \
-                 or [r0.get("feature_text", "")]
-        q = embed_texts(model, tok, chunks[: cfg["features"]["max_chunks"]],
+        chunks = ([c.get("text", "") for c in r0.get("feature_chunks", [])]
+                  or [r0.get("feature_text", "")])
+        q = embed_texts(model, tok,
+                        chunks[: cfg["features"]["max_chunks"]],
                         device, mcfg["nl_length"])
 
         scores, labels = [], []
         for r in cands:
             funcs = extract_functions(r.get("class_text", ""), fcfg)
             fe    = embed_texts(model, tok, funcs, device, mcfg["code_length"])
-            sims  = (q @ fe.t())                      # (n_chunks, n_funcs)
+            sims  = q @ fe.t()                           # (n_chunks, n_funcs)
             scores.append(sims.max().item())
             labels.append(int(r.get("label", 0)))
         mrrs.append(mean_reciprocal_rank(scores, labels))
         r10s.append(recall_at_k(scores, labels, 10))
+
     n = max(len(mrrs), 1)
     return sum(mrrs) / n, sum(r10s) / n
 
+
+# ── Main ────
 
 def main():
     ap = argparse.ArgumentParser()
@@ -131,55 +157,72 @@ def main():
     torch.manual_seed(ft.get("seed", 123456))
     random.seed(ft.get("seed", 123456))
     device = torch.device("cuda" if torch.cuda.is_available() else
-                          "mps" if torch.backends.mps.is_available() else "cpu")
-    out_dir = Path(cfg["output_dir"]); out_dir.mkdir(parents=True, exist_ok=True)
+                          "mps"  if torch.backends.mps.is_available() else "cpu")
+    log.info("Device: %s", device)
+    log.info("Model : %s", mcfg["model_name"])
+
+    out_dir = Path(cfg["output_dir"])
+    out_dir.mkdir(parents=True, exist_ok=True)
     json.dump(cfg, open(out_dir / "config_flim.json", "w"), indent=2)
+    log.info("Output dir: %s", out_dir)
 
     tok   = AutoTokenizer.from_pretrained(mcfg["model_name"])
     model = build_flim_encoder(mcfg).to(device)
 
-    log.info("Building fine-tuning pairs from %s", cfg["train_jsonl"])
+    log.info("Building fine-tuning pairs from  %s", cfg["train_jsonl"])
     pairs = build_pairs(Path(cfg["train_jsonl"]), fcfg,
                         ft.get("max_pairs_per_file", 30))
-    log.info("Fine-tuning pairs: %d", len(pairs))
 
     ds     = PairDataset(pairs, tok, mcfg["nl_length"], mcfg["code_length"])
     loader = DataLoader(ds, batch_size=ft["batch_size"], shuffle=True,
                         num_workers=ft.get("num_workers", 4),
                         pin_memory=True, drop_last=True)
+    log.info("DataLoader: %d batches per epoch  (batch_size=%d)",
+             len(loader), ft["batch_size"])
 
     opt   = torch.optim.AdamW(model.parameters(), lr=ft["lr"],
-                              weight_decay=ft.get("weight_decay", 0.01))
+                               weight_decay=ft.get("weight_decay", 0.01))
     total = len(loader) * ft["epochs"]
     sched = get_linear_schedule_with_warmup(
         opt, int(total * ft.get("warmup_ratio", 0.1)), total)
 
     val_issues = load_jsonl_by_issue(Path(cfg["val_jsonl"]))
-    best_mrr   = -1.0
+    log.info("Validation issues loaded: %d  (from %s)", len(val_issues), cfg["val_jsonl"])
+    best_mrr = -1.0
 
     for epoch in range(1, ft["epochs"] + 1):
-        model.train(); tot = 0.0
-        for batch in tqdm(loader, desc=f"Epoch {epoch}"):
+        model.train()
+        tot, n_batches = 0.0, 0
+        pbar = tqdm(loader,
+                    desc=f"Epoch {epoch:02d}/{ft['epochs']:02d} [train]",
+                    unit="batch", dynamic_ncols=True)
+        for batch in pbar:
             loss = model(batch["nl_ids"].to(device),  batch["nl_mask"].to(device),
                          batch["code_ids"].to(device), batch["code_mask"].to(device))
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(),
                                            ft.get("max_grad_norm", 1.0))
             opt.step(); sched.step(); opt.zero_grad()
-            tot += loss.item()
-        log.info("Epoch %d | train loss %.4f", epoch, tot / max(len(loader), 1))
+            tot += loss.item(); n_batches += 1
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
+        avg_loss = tot / max(n_batches, 1)
+        log.info("Epoch %02d/%02d | avg train loss %.4f", epoch, ft["epochs"], avg_loss)
 
         model.eval()
         mrr, r10 = file_level_eval(model, tok, val_issues, cfg, device)
-        log.info("Epoch %d | val MRR %.4f | val R@10 %.4f", epoch, mrr, r10)
+        log.info("Epoch %02d/%02d | val MRR %.4f | val R@10 %.4f",
+                 epoch, ft["epochs"], mrr, r10)
+
         if mrr > best_mrr:
             best_mrr = mrr
             torch.save({"model_state": model.state_dict(),
                         "epoch": epoch, "val_mrr": mrr},
                        out_dir / "best_flim_encoder.pt")
-            log.info("  ↑ new best — checkpoint saved")
+            log.info("  ↑ new best MRR %.4f at epoch %d — checkpoint saved",
+                     mrr, epoch)
 
-    log.info("Done. Best val MRR = %.4f", best_mrr)
+    log.info("Fine-tuning complete.  Best val MRR = %.4f", best_mrr)
+    log.info("Best checkpoint: %s", out_dir / "best_flim_encoder.pt")
 
 
 if __name__ == "__main__":
