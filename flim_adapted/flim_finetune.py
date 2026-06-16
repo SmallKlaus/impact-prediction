@@ -34,7 +34,8 @@ from tqdm import tqdm
 
 from flim_model  import build_flim_encoder
 from flim_common import (extract_functions, load_jsonl_by_issue,
-                         mean_reciprocal_rank, recall_at_k)
+                    mean_reciprocal_rank, recall_at_k,
+                    open_source_cache, lookup_source)
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 ssl._create_default_https_context = ssl._create_unverified_context
@@ -158,9 +159,9 @@ class PairDataset(Dataset):
     def __getitem__(self, idx):
         nl, code = self.pairs[idx]
         n = self.tok(nl,   max_length=self.nl_len,   truncation=True,
-                     padding="max_length", return_tensors="pt")
+                    padding="max_length", return_tensors="pt")
         c = self.tok(code, max_length=self.code_len, truncation=True,
-                     padding="max_length", return_tensors="pt")
+                    padding="max_length", return_tensors="pt")
         return {"nl_ids":   n["input_ids"].squeeze(0),
                 "nl_mask":  n["attention_mask"].squeeze(0),
                 "code_ids": c["input_ids"].squeeze(0),
@@ -169,15 +170,28 @@ class PairDataset(Dataset):
 
 # ── Pair builder ────
 
-def build_pairs(train_jsonl: Path, func_cfg: dict, max_pairs_per_file: int):
+def build_pairs(train_jsonl: Path, func_cfg: dict, max_pairs_per_file: int,
+                cache_conn=None):
+    """
+    Build (feature_text, java_function) training pairs from the positive
+    records in train.jsonl.
+
+    cache_conn : sqlite3.Connection from open_source_cache(), or None.
+                 When provided, raw Java source is looked up by (sha_before,
+                 class_path) so the AST extractor receives actual method bodies
+                 instead of class-summary text.  A per-run hit/miss tally is
+                 logged at the end to track fidelity.
+    """
     by_issue = load_jsonl_by_issue(train_jsonl)
     log.info("Loaded %d issues from %s", len(by_issue), train_jsonl)
     pairs, seen = [], set()
+    cache_hits = cache_misses = 0
+
     for jid, recs in tqdm(by_issue.items(),
-                          desc="Building (feature, function) pairs",
-                          unit="issue", dynamic_ncols=True):
+                    desc="Building (feature, function) pairs",
+                    unit="issue", dynamic_ncols=True):
         feat = next((r.get("feature_text", "") for r in recs
-                     if r.get("feature_text")), "")
+                    if r.get("feature_text")), "")
         if not feat:
             continue
         for r in recs:
@@ -187,11 +201,36 @@ def build_pairs(train_jsonl: Path, func_cfg: dict, max_pairs_per_file: int):
             if key in seen:
                 continue
             seen.add(key)
-            funcs = extract_functions(r.get("class_text", ""), func_cfg)
+            raw_src = lookup_source(cache_conn,
+                                    r.get("sha_before", ""),
+                                    r.get("class_path", ""))
+            if raw_src is not None:
+                cache_hits += 1
+            else:
+                cache_misses += 1
+            funcs = extract_functions(r.get("class_text", ""), func_cfg,
+                                      raw_source=raw_src)
             for fn in funcs[:max_pairs_per_file]:
                 pairs.append((feat, fn))
-    log.info("Built %d fine-tuning pairs  |  unique (issue, file) anchors: %d",
-             len(pairs), len(seen))
+
+    total_anchors = cache_hits + cache_misses
+    log.info(
+        "Built %d fine-tuning pairs  |  unique (issue, file) anchors: %d",
+        len(pairs), len(seen),
+    )
+    log.info(
+        "Source cache — hits: %d / %d  (%.1f%%)  misses: %d  "
+        "[hits use real Java; misses fall back to class_text summary]",
+        cache_hits, total_anchors,
+        100 * cache_hits / max(total_anchors, 1),
+        cache_misses,
+    )
+    if cache_conn is None:
+        log.warning(
+            "No source cache provided — all %d positive anchors use class_text "
+            "summaries.  Run build_source_cache.py locally and pass --source-cache.",
+            len(seen),
+        )
     return pairs
 
 
@@ -208,15 +247,22 @@ def embed_texts(embed_par, tok, texts, primary_device, max_len, bs=256):
         enc = tok(texts[s:s + bs], max_length=max_len, truncation=True,
                   padding="max_length", return_tensors="pt")
         out.append(embed_par(enc["input_ids"].to(primary_device),
-                             enc["attention_mask"].to(primary_device)).cpu())
+                    enc["attention_mask"].to(primary_device)).cpu())
     return torch.cat(out) if out else torch.empty(0)
 
 
 # ── Validation ────
 
 @torch.no_grad()
-def file_level_eval(embed_par, tok, val_issues, cfg, primary_device):
-    """FLIM semantic score (max-pool over functions, max-pool over query chunks)."""
+def file_level_eval(embed_par, tok, val_issues, cfg, primary_device,
+                    cache_conn=None):
+    """
+    FLIM semantic score (max-pool over functions, max-pool over query chunks).
+
+    cache_conn : sqlite3.Connection or None.  When provided, raw Java source
+                 is used for function extraction; otherwise falls back to
+                 class_text.  Same lookup pattern as build_pairs.
+    """
     mcfg, fcfg = cfg["model"], cfg["functions"]
     ft         = cfg["finetune"]
     rng        = random.Random(ft.get("seed", 123456))
@@ -228,7 +274,7 @@ def file_level_eval(embed_par, tok, val_issues, cfg, primary_device):
 
     mrrs, r10s = [], []
     for jid, recs in tqdm(eval_items, desc="  Val eval",
-                          unit="issue", leave=False, dynamic_ncols=True):
+                    unit="issue", leave=False, dynamic_ncols=True):
         pos = [r for r in recs if int(r.get("label", 0)) == 1]
         neg = [r for r in recs if int(r.get("label", 0)) == 0]
         if not pos:
@@ -240,14 +286,18 @@ def file_level_eval(embed_par, tok, val_issues, cfg, primary_device):
         chunks = ([c.get("text", "") for c in r0.get("feature_chunks", [])]
                   or [r0.get("feature_text", "")])
         q = embed_texts(embed_par, tok,
-                        chunks[: cfg["features"]["max_chunks"]],
-                        primary_device, mcfg["nl_length"])
+                    chunks[: cfg["features"]["max_chunks"]],
+                    primary_device, mcfg["nl_length"])
 
         scores, labels = [], []
         for r in cands:
-            funcs = extract_functions(r.get("class_text", ""), fcfg)
+            raw_src = lookup_source(cache_conn,
+                                    r.get("sha_before", ""),
+                                    r.get("class_path", ""))
+            funcs = extract_functions(r.get("class_text", ""), fcfg,
+                                      raw_source=raw_src)
             fe    = embed_texts(embed_par, tok, funcs,
-                                primary_device, mcfg["code_length"])
+                    primary_device, mcfg["code_length"])
             sims  = q @ fe.t()
             scores.append(sims.max().item())
             labels.append(int(r.get("label", 0)))
@@ -263,10 +313,32 @@ def file_level_eval(embed_par, tok, val_issues, cfg, primary_device):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
+    ap.add_argument(
+        "--source-cache", default=None,
+        help=(
+            "Path to source_cache.sqlite built by build_source_cache.py. "
+            "When provided, raw Java source is used for function extraction "
+            "instead of class_text summaries, making fine-tuning faithful to "
+            "the original FLIM. Can also be set via config['source_cache']."
+        ),
+    )
     args = ap.parse_args()
     cfg  = json.load(open(args.config, encoding="utf-8"))
     mcfg, ft, fcfg = cfg["model"], cfg["finetune"], cfg["functions"]
     multi_cfg       = cfg.get("multi_gpu", {})
+
+    # Source cache: CLI flag takes precedence over config key
+    cache_path  = args.source_cache or cfg.get("source_cache")
+    cache_conn  = open_source_cache(cache_path)
+    if cache_conn:
+        log.info("Source cache loaded: %s", cache_path)
+    else:
+        log.warning(
+            "Source cache NOT loaded (path=%s). Fine-tuning will use class_text "
+            "summaries for function extraction — results will be degraded. "
+            "Run build_source_cache.py locally and pass --source-cache.",
+            cache_path,
+        )
 
     torch.manual_seed(ft.get("seed", 123456))
     random.seed(ft.get("seed", 123456))
@@ -292,18 +364,18 @@ def main():
     log.info("Model parameters: %d", sum(p.numel() for p in model.parameters()))
 
     opt = torch.optim.AdamW(model.parameters(), lr=ft["lr"],
-                             weight_decay=ft.get("weight_decay", 0.01))
+                    weight_decay=ft.get("weight_decay", 0.01))
 
     # ── Wrap for multi-GPU embedding (after optimizer) ──
     embed_par = setup_embed_parallel(model, multi_cfg, primary)
 
     log.info("Building fine-tuning pairs from %s", cfg["train_jsonl"])
     pairs  = build_pairs(Path(cfg["train_jsonl"]), fcfg,
-                         ft.get("max_pairs_per_file", 30))
+                    ft.get("max_pairs_per_file", 30))
     ds     = PairDataset(pairs, tok, mcfg["nl_length"], mcfg["code_length"])
     loader = DataLoader(ds, batch_size=ft["batch_size"], shuffle=True,
-                        num_workers=ft.get("num_workers", 4),
-                        pin_memory=primary.type == "cuda", drop_last=True)
+                    num_workers=ft.get("num_workers", 4),
+                    pin_memory=primary.type == "cuda", drop_last=True)
     log.info("DataLoader: %d batches/epoch  (batch_size=%d)",
              len(loader), ft["batch_size"])
 
@@ -337,7 +409,7 @@ def main():
             loss = infonce_loss(nl_emb, code_emb, scale)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(),
-                                           ft.get("max_grad_norm", 1.0))
+                    ft.get("max_grad_norm", 1.0))
             opt.step(); sched.step(); opt.zero_grad()
             tot += loss.item(); n_batches += 1
             pbar.set_postfix(loss=f"{loss.item():.4f}")
@@ -355,10 +427,10 @@ def main():
             best_mrr = mrr
             # Always save from the raw model, not the wrapper
             torch.save({"model_state": model.state_dict(),
-                        "epoch": epoch, "val_mrr": mrr},
-                       out_dir / "best_flim_encoder.pt")
+                    "epoch": epoch, "val_mrr": mrr},
+                    out_dir / "best_flim_encoder.pt")
             log.info("  ↑ new best MRR %.4f at epoch %d — checkpoint saved",
-                     mrr, epoch)
+                    mrr, epoch)
 
     log.info("Fine-tuning complete.  Best val MRR = %.4f", best_mrr)
     log.info("Best checkpoint: %s", out_dir / "best_flim_encoder.pt")

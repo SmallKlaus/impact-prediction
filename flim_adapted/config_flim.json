@@ -1,54 +1,64 @@
 {
-  "train_jsonl":  "/data1/amine/IMPACT_TRAINING_SAMPLES/SAMPLES_V4/train.jsonl",
-  "val_jsonl":    "/data1/amine/IMPACT_TRAINING_SAMPLES/SAMPLES_V4/val_500.jsonl",
-  "test_jsonl":   "/data1/amine/IMPACT_TRAINING_SAMPLES/SAMPLES_V4/test_full.jsonl",
-  "output_dir":   "/data1/amine/checkpoints/flim_run_001",
-
+  "train_jsonl": "/data1/amine/IMPACT_TRAINING_SAMPLES/SAMPLES_V4/train_2000.jsonl",
+  "val_jsonl": "/data1/amine/IMPACT_TRAINING_SAMPLES/SAMPLES_V4/val_500.jsonl",
+  "test_jsonl": "/data1/amine/IMPACT_TRAINING_SAMPLES/SAMPLES_V4/test_full.jsonl",
+  "output_dir": "/data1/amine/checkpoints/flim_run_001",
+  "source_cache": "",
   "model": {
-    "model_name":  "microsoft/codebert-base",
-    "nl_length":   128,
+    "model_name": "microsoft/codebert-base",
+    "nl_length": 128,
     "code_length": 256,
-    "scale":       20.0
+    "scale": 20.0
   },
-
   "functions": {
-    "mode":               "ast",
-    "max_func_tokens":    200,
+    "mode": "ast",
+    "max_functions": 50,
     "include_file_header": true,
-    "header_tokens":      64,
-    "min_func_length":    10,
-    "fallback_window":    200,
-    "fallback_stride":    100
+    "header_tokens": 64,
+    "min_function_chars": 30,
+    "fallback_window": 200
   },
-
   "features": {
-    "max_chunks":       4,
-    "top_k_mean":       3,
+    "max_chunks": 4,
+    "top_k_mean": 3,
     "embed_batch_size": 256
   },
-
   "finetune": {
-    "batch_size":         32,
-    "lr":                 2e-5,
-    "epochs":             10,
-    "warmup_ratio":       0.1,
-    "max_grad_norm":      1.0,
-    "weight_decay":       0.01,
-    "num_workers":        4,
-    "seed":               123456,
+    "batch_size": 32,
+    "lr": 2e-5,
+    "epochs": 10,
+    "warmup_ratio": 0.1,
+    "max_grad_norm": 1.0,
+    "weight_decay": 0.01,
+    "num_workers": 4,
+    "seed": 123456,
     "max_pairs_per_file": 30,
-    "val_max_issues":     50,
+    "val_max_issues": 50,
     "val_max_candidates": 100
   },
-
   "ltr": {
-    "seed":      123456,
-    "alphas":    [0.0001, 0.001, 0.01],
-    "cut_percs": [0.05, 0.1, 0.15, 0.2, 0.25, 0.3]
+    "seed": 123456,
+    "alphas": [
+      0.0001,
+      0.001,
+      0.01
+    ],
+    "cut_percs": [
+      0.05,
+      0.1,
+      0.15,
+      0.2,
+      0.25,
+      0.3
+    ]
   },
-
   "multi_gpu": {
-    "enabled":    false,
-    "device_ids": [0, 1, 2, 3]
+    "enabled": false,
+    "device_ids": [
+      0,
+      1,
+      2,
+      3
+    ]
   }
 }

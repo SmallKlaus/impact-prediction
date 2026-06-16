@@ -6,9 +6,19 @@ Metric helpers are copied verbatim from diagnose_ce.py so numbers are
 computed identically across baselines.
 """
 from __future__ import annotations
-import json, math, re
+import json, math, re, sqlite3
 from collections import defaultdict
 from pathlib import Path
+
+# ── javalang availability (pure-Python AST parser for Java) ────
+# Install: pip install javalang
+# If unavailable, extract_java_methods_ast falls back to the regex extractor.
+_JAVALANG_AVAILABLE = False
+try:
+    import javalang as _javalang  # type: ignore
+    _JAVALANG_AVAILABLE = True
+except ImportError:
+    pass
 
 # ── Token normalization (camelCase / snake_case aware) ────
 _CAMEL_1 = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
@@ -73,7 +83,7 @@ def _find_block_end(src: str, open_idx: int) -> int:
     return -1
 
 def extract_java_methods(source: str, max_functions: int = 50,
-                         min_chars: int = 30) -> list[str]:
+                    min_chars: int = 30) -> list[str]:
     """Extract method bodies (header included). Best-effort regex+brace parser."""
     methods, pos = [], 0
     while len(methods) < max_functions:
@@ -106,6 +116,142 @@ def extract_java_methods(source: str, max_functions: int = 50,
         pos = end + 1
     return methods
 
+def _build_line_offsets(source: str) -> list[int]:
+    """Return a list where offsets[i] = char index of the start of line i (0-indexed)."""
+    offsets = []
+    pos = 0
+    for line in source.splitlines(keepends=True):
+        offsets.append(pos)
+        pos += len(line)
+    return offsets
+
+
+def extract_java_methods_ast(source: str, max_functions: int = 50,
+                              min_chars: int = 30) -> list[str]:
+    """
+    Extract method bodies using javalang's AST parser.
+
+    Algorithm
+    ---------
+    1. Parse source to AST with javalang.
+    2. Build a line→char-offset map (needed because javalang positions are
+       line/column, not absolute character indices).
+    3. For each MethodDeclaration / ConstructorDeclaration with a body,
+       convert its start position to a char offset, then use _find_block_end
+       to locate the closing brace.
+    4. Slice [start : end+1] from the raw source — this preserves every token
+       (modifiers, generics, annotations, Javadoc *if it immediately precedes
+       the declaration position*) exactly as the original FLIM AST extractor did.
+
+    Falls back to extract_java_methods (regex) on any parse error so the
+    pipeline never crashes on unusual Java syntax (records, sealed classes,
+    text blocks in Java ≥ 14).
+    """
+    if not _JAVALANG_AVAILABLE:
+        return extract_java_methods(source, max_functions, min_chars)
+
+    try:
+        tree = _javalang.parse.parse(source)
+    except Exception:
+        # Unsupported syntax, encoding issues, etc.
+        return extract_java_methods(source, max_functions, min_chars)
+
+    line_offsets = _build_line_offsets(source)
+    src_len = len(source)
+    methods: list[str] = []
+
+    for _, node in tree:
+        if not isinstance(
+            node,
+            (_javalang.tree.MethodDeclaration,
+             _javalang.tree.ConstructorDeclaration),
+        ):
+            continue
+        if node.position is None:
+            continue
+        # Abstract methods and interface default stubs have no body
+        if getattr(node, "body", None) is None:
+            continue
+
+        ln, col = node.position.line, node.position.column
+        if ln - 1 >= len(line_offsets):
+            continue
+        start = line_offsets[ln - 1] + (col - 1)
+        if start >= src_len:
+            continue
+
+        # Find the opening brace of the method body from the declaration start
+        brace = source.find("{", start)
+        if brace == -1:
+            continue
+        end = _find_block_end(source, brace)
+        if end == -1:
+            continue
+
+        body = source[start : end + 1].strip()
+        if len(body) >= min_chars:
+            methods.append(body)
+        if len(methods) >= max_functions:
+            break
+
+    if not methods:
+        # javalang parsed OK but no methods found (empty class, pure interface, …)
+        return extract_java_methods(source, max_functions, min_chars)
+
+    return methods
+
+
+# ── Source cache helpers (SQLite) ────
+# The cache is built locally by build_source_cache.py and transferred to the
+# server.  All server-side scripts look up raw Java source via these helpers;
+# if the cache is absent or a key is missing, they fall back to class_text.
+
+def open_source_cache(cache_path: str | Path | None) -> sqlite3.Connection | None:
+    """
+    Open the SQLite source cache and return a connection.
+    Returns None if cache_path is None or empty — downstream code treats
+    None as "no cache available, use class_text summaries".
+
+    check_same_thread=False: the connection is opened in the main process
+    and used only there (DataLoader workers do not call extract_functions).
+    """
+    if not cache_path:
+        return None
+    try:
+        conn = sqlite3.connect(str(cache_path), check_same_thread=False)
+        # Smoke-test: make sure the expected table exists
+        conn.execute("SELECT 1 FROM source_cache LIMIT 1")
+        return conn
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning(
+            "Could not open source cache at %s: %s — falling back to class_text",
+            cache_path, exc,
+        )
+        return None
+
+
+def lookup_source(cache_conn: sqlite3.Connection | None,
+                  sha: str, class_path: str) -> str | None:
+    """
+    Return raw Java source for (sha, class_path) from the SQLite cache.
+    Returns None on any miss (cache absent, key not found, status != 'ok').
+    """
+    if cache_conn is None or not sha or not class_path:
+        return None
+    try:
+        row = cache_conn.execute(
+            "SELECT source, status FROM source_cache"
+            " WHERE sha=? AND class_path=?",
+            (sha, class_path),
+        ).fetchone()
+        if row is not None and row[1] == "ok" and row[0]:
+            return row[0]
+    except Exception:
+        pass
+    return None
+
+
 def window_chunks(source: str, window_tokens: int = 200,
                   max_functions: int = 50) -> list[str]:
     words = (source or "").split()
@@ -113,19 +259,64 @@ def window_chunks(source: str, window_tokens: int = 200,
            for s in range(0, len(words), window_tokens)]
     return [w for w in out if w][:max_functions]
 
-def extract_functions(class_text: str, cfg: dict) -> list[str]:
-    """Segment a file into 'functions' per FLIM. Falls back to fixed windows."""
-    mode   = cfg.get("mode", "java")
-    max_f  = cfg.get("max_functions", 50)
+def extract_functions(class_text: str, cfg: dict,
+                      raw_source: str | None = None) -> list[str]:
+    """
+    Segment a file into 'functions' per FLIM.  Falls back to fixed windows.
+
+    Parameters
+    ----------
+    class_text  : structured summary from the JSONL dataset (always available)
+    cfg         : functions block from config_flim.json
+    raw_source  : full Java source recovered from git (may be None if the cache
+                  is absent or the file was not found at sha_before)
+
+    Behaviour
+    ---------
+    • mode="ast"  — preferred when raw_source is available; uses the javalang
+                    AST extractor on the real source.  Automatically falls back
+                    to the regex extractor if javalang is not installed or the
+                    source cannot be parsed (e.g. Java 17+ syntax).
+    • mode="java" — always uses the regex+brace extractor on (raw_source or
+                    class_text), no AST dependency.
+    • mode="window" — skips method extraction entirely; only window chunks.
+
+    The file-header pseudo-function (first `header_tokens` words) is always
+    prepended when include_file_header=True.  If no real methods are found
+    after extraction, the whole source is split into overlapping windows so
+    the pipeline always produces a non-empty segment list.
+    """
+    mode      = cfg.get("mode", "java")
+    max_f     = cfg.get("max_functions", 50)
+    min_chars = cfg.get("min_function_chars", cfg.get("min_func_length", 30))
+    # source to extract from: prefer real Java over summary
+    source = raw_source if raw_source is not None else class_text
+
     funcs: list[str] = []
-    if mode == "java":
-        funcs = extract_java_methods(class_text, max_f,
-                                     cfg.get("min_function_chars", 30))
+
+    if mode == "ast":
+        if raw_source is not None:
+            # Full source available → use AST parser (with regex fallback inside)
+            funcs = extract_java_methods_ast(source, max_f, min_chars)
+        else:
+            # No raw source → regex on the summary (degraded, logged by caller)
+            funcs = extract_java_methods(class_text, max_f, min_chars)
+    elif mode == "java":
+        funcs = extract_java_methods(source, max_f, min_chars)
+    # mode == "window": skip method extraction, go straight to chunking below
+
     if cfg.get("include_file_header", True):
-        header = " ".join((class_text or "").split()[: cfg.get("window_tokens", 200)])
-        if header: funcs = [header] + funcs
-    if len(funcs) <= (1 if cfg.get("include_file_header", True) else 0):
-        funcs = window_chunks(class_text, cfg.get("window_tokens", 200), max_f)
+        n_header = cfg.get("header_tokens", cfg.get("window_tokens", 200))
+        header   = " ".join((source or "").split()[:n_header])
+        if header:
+            funcs = [header] + funcs
+
+    # Fallback: if only the header was found (or nothing at all), use windows
+    n_real = len(funcs) - (1 if cfg.get("include_file_header", True) and funcs else 0)
+    if n_real <= 0:
+        wt    = cfg.get("fallback_window", cfg.get("window_tokens", 200))
+        funcs = window_chunks(source, wt, max_f)
+
     return funcs[:max_f] if funcs else [""]
 
 # ── JSONL ────
