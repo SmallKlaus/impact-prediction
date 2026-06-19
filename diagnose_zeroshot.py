@@ -1,8 +1,8 @@
 """
-diagnose_unixcoder_baseline.py — Zero-Shot UniXcoder Cosine-Similarity Baseline
+diagnose_zeroshot_baseline.py — Zero-Shot Cosine-Similarity Baseline
 =================================================================================
 Provides a neural *lower-bound* baseline for the bi-encoder pipeline by running
-the pretrained UniXcoder model **without any task-specific fine-tuning**.
+a pretrained model **without any task-specific fine-tuning**.
 
 Ranking signal
 --------------
@@ -12,7 +12,7 @@ between their raw CLS vectors produced by the frozen, pretrained backbone:
     score(issue, class) = cos( CLS_f , CLS_c )
                         = (CLS_f · CLS_c) / (‖CLS_f‖ ‖CLS_c‖)
 
-No projection head, no interaction MLP, no training — this is UniXcoder
+No projection head, no interaction MLP, no training — this is the model
 "out of the box".
 
 The feature embedding is computed as the mean of individual chunk CLS vectors
@@ -23,10 +23,10 @@ absence of task-specific fine-tuning.
 Why this baseline matters (thesis framing)
 ------------------------------------------
 Including a zero-shot baseline directly answers the question: *"How much of the
-retrieval performance comes from UniXcoder's pre-trained representations versus
-the task-specific training procedure?"*  The three-way comparison:
+retrieval performance comes from the model's pre-trained representations versus
+the task-specific training procedure?"* The three-way comparison:
 
-    BM25  <  UniXcoder (zero-shot)  <  Bi-encoder (trained)
+    BM25  <  Zero-shot model  <  Bi-encoder (trained)
 
 quantifies the contribution of (a) switching from lexical to semantic search,
 and (b) the supervised fine-tuning of the semantic model.  Both contributions
@@ -43,20 +43,28 @@ Report structure (identical to diagnose.py)
 
 Usage
 -----
-    python diagnose_unixcoder_baseline.py \\
-        --model-name  /path/to/unixcoder-base \\
+    python diagnose_zeroshot_baseline.py \\
+        --model-name  /path/to/model-base \\
         --val-jsonl   /data/val_full.jsonl \\
-        --output      /data/baseline_unixcoder_val.json \\
+        --output      /data/baseline_val.json \\
+        [--cuda-devices 0 1 2] \\
         [--test-jsonl /data/test_full.jsonl] \\
-        [--test-output /data/baseline_unixcoder_test.json] \\
+        [--test-output /data/baseline_test.json] \\
         [--batch-size 32] \\
         [--worst-n   20]
 
     # Using config.json to infer model path (convenient for one-stop comparison)
-    python diagnose_unixcoder_baseline.py \\
+    python diagnose_zeroshot_baseline.py \\
         --config      /data/checkpoints/run_015/config.json \\
         --val-jsonl   /data/val_full.jsonl \\
-        --output      /data/baseline_unixcoder_val.json
+        --output      /data/baseline_val.json
+
+    # Multi-GPU: spread across CUDA devices 0 and 1
+    python diagnose_zeroshot_baseline.py \\
+        --model-name  /path/to/model-base \\
+        --val-jsonl   /data/val_full.jsonl \\
+        --output      /data/baseline_val.json \\
+        --cuda-devices 0 1
 
 Notes
 -----
@@ -69,6 +77,11 @@ Notes
 * Class embeddings are cached per sha_before snapshot (same optimisation used
   by HardNegativeMiner): each codebase state is encoded once, then re-used for
   all issues that share it.
+* Multi-GPU support uses torch.nn.DataParallel.  Pass --cuda-devices to select
+  which CUDA device IDs participate (e.g. --cuda-devices 0 1).  The first ID
+  in the list is the primary (gathering) device.  Omitting the flag defaults to
+  a single GPU (cuda:0) when CUDA is available.  The batch is split across GPUs
+  automatically; all parameters remain frozen throughout.
 """
 
 from __future__ import annotations
@@ -103,6 +116,36 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Backbone wrapper
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _BackboneCLSWrapper(torch.nn.Module):
+    """
+    Thin nn.Module shim around a HuggingFace AutoModel.
+
+    Returning a plain tensor (last_hidden_state) instead of a ModelOutput
+    dataclass ensures that torch.nn.DataParallel can gather outputs across
+    devices correctly in all supported PyTorch versions.  Parameters are
+    expected to be frozen before this wrapper is constructed; the wrapper
+    itself introduces no new learnable parameters.
+    """
+
+    def __init__(self, backbone: torch.nn.Module) -> None:
+        super().__init__()
+        self.backbone = backbone
+
+    def forward(
+        self,
+        input_ids:      torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return last_hidden_state: (batch, seq_len, hidden_size)."""
+        return self.backbone(
+            input_ids, attention_mask=attention_mask
+        ).last_hidden_state
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -190,7 +233,7 @@ def project_of(jira_id: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Zero-shot UniXcoder encoding
+# Zero-shot Encoding
 # ─────────────────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
@@ -202,9 +245,14 @@ def _cls(
     """
     Extract the [CLS] hidden state from the pretrained backbone.
 
-    UniXcoder uses the first token (index 0) of last_hidden_state as the
+    Uses the first token (index 0) of last_hidden_state as the
     sequence-level representation — identical to the ImpactScoreModel._encode_single
     convention, ensuring the embeddings are semantically comparable.
+
+    ``backbone`` is expected to be a ``_BackboneCLSWrapper`` (possibly wrapped
+    in ``torch.nn.DataParallel``).  The wrapper's forward returns
+    ``last_hidden_state`` as a plain tensor, which DataParallel can gather
+    across devices without version-specific workarounds.
 
     Args:
         input_ids      : (..., seq_len) — arbitrary leading batch dimensions
@@ -219,11 +267,12 @@ def _cls(
     flat_ids   = input_ids.view(-1, seq_len)
     flat_mask  = attention_mask.view(-1, seq_len)
 
-    outputs    = backbone(flat_ids, attention_mask=flat_mask)
-    cls_hidden = outputs.last_hidden_state[:, 0, :]   # (batch_flat, hidden)
+    # backbone returns last_hidden_state tensor: (batch_flat, seq_len, hidden)
+    last_hidden = backbone(flat_ids, attention_mask=flat_mask)
+    cls_hidden  = last_hidden[:, 0, :]   # (batch_flat, hidden)
 
     # L2-normalise so cosine similarity reduces to a dot product
-    cls_norm   = F.normalize(cls_hidden, dim=-1)
+    cls_norm = F.normalize(cls_hidden, dim=-1)
     return cls_norm.view(*orig_shape, cls_hidden.shape[-1])
 
 
@@ -408,6 +457,7 @@ def print_report(
     per_project:    dict,
     worst_issues:   list,
     worst_n:        int,
+    model_name:     str,
 ):
     """Print a console summary identical in format to diagnose.py."""
     KS      = [5, 10, 20, 50, 80, 100]
@@ -416,7 +466,7 @@ def print_report(
     n = global_metrics["n_issues"]
 
     print("\n" + "=" * 70)
-    print(f"GLOBAL METRICS — UniXcoder Zero-Shot Baseline  [{split_name}]")
+    print(f"GLOBAL METRICS — {model_name} Zero-Shot Baseline  [{split_name}]")
     print("=" * 70)
     print(f"  Issues evaluated : {n}")
     for k in KS:
@@ -522,13 +572,13 @@ def run_split(
         )
 
     report = {
-        "baseline":       "unixcoder_zero_shot",
+        "baseline":       f"{model_name}_zero_shot",
         "model_name":     model_name,
         "split":          split_name,
         "jsonl_path":     str(jsonl_path),
         "scoring_method": "cosine_similarity_CLS",
         "description": (
-            "Pretrained UniXcoder with no fine-tuning. "
+            f"Pretrained {model_name} with no fine-tuning. "
             "Feature: mean of chunk CLS vectors (L2-normalised). "
             "Class: CLS vector (L2-normalised). "
             "Score: cosine similarity = dot product after normalisation."
@@ -545,7 +595,7 @@ def run_split(
         json.dump(report, f, indent=2, ensure_ascii=False)
 
     print_report(split_name, global_metrics, distribution,
-                 per_project, worst_issues, worst_n)
+                 per_project, worst_issues, worst_n, model_name)
     print(f"\nReport saved to: {output_path}\n")
 
     return report
@@ -558,7 +608,7 @@ def run_split(
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Zero-shot UniXcoder cosine-similarity baseline diagnostic. "
+            "Zero-shot model cosine-similarity baseline diagnostic. "
             "Produces reports in the same format as diagnose.py for "
             "direct comparison."
         )
@@ -567,8 +617,8 @@ def main():
     # ── Model identification ───────────────────────────────────────────────
     parser.add_argument(
         "--model-name", default=None,
-        help="Path or HuggingFace name of the pretrained UniXcoder model "
-             "(e.g. '/path/to/unixcoder-base' or "
+        help="Path or HuggingFace name of the pretrained model "
+             "(e.g. '/path/to/model-base' or "
              "'microsoft/unixcoder-base'). "
              "Overrides the value inferred from --config.",
     )
@@ -608,6 +658,21 @@ def main():
     parser.add_argument("--worst-n",     type=int, default=20,
                         help="Number of worst issues to highlight (default 20)")
 
+    # ── Device ────────────────────────────────────────────────────────────────
+    parser.add_argument(
+        "--cuda-devices", type=int, nargs="+", default=None,
+        metavar="ID",
+        help=(
+            "CUDA device IDs to use, in order of preference.  "
+            "The first ID is the primary (output-gathering) device. "
+            "Pass a single ID to pin to that GPU (e.g. --cuda-devices 1). "
+            "Pass multiple IDs to enable DataParallel "
+            "(e.g. --cuda-devices 0 1 2). "
+            "Omit to use cuda:0 when CUDA is available, or fall back to "
+            "MPS / CPU."
+        ),
+    )
+
     args = parser.parse_args()
 
     # ── Merge config + CLI ────────────────────────────────────────────────────
@@ -636,7 +701,7 @@ def main():
     )
     max_chunks = (
         args.max_chunks
-        or cfg.get("training", {}).get("max_chunks", 8)
+        or cfg.get("training", {}).get("max_chunks", 4)
     )
     num_workers = (
         args.num_workers
@@ -650,35 +715,99 @@ def main():
     if not val_jsonl.exists():
         import sys; sys.exit(f"--val-jsonl not found: {val_jsonl}")
 
-    # ── Device ────────────────────────────────────────────────────────────────
-    device = torch.device(
-        "cuda" if torch.cuda.is_available() else
-        "mps"  if torch.backends.mps.is_available() else "cpu"
-    )
-    log.info("Device     : %s", device)
+    # ── Device / multi-GPU selection ──────────────────────────────────────────
+    import sys
+
+    cuda_available = torch.cuda.is_available()
+
+    if cuda_available:
+        n_cuda = torch.cuda.device_count()
+
+        if args.cuda_devices is not None:
+            # Validate requested IDs
+            bad = [d for d in args.cuda_devices if d < 0 or d >= n_cuda]
+            if bad:
+                sys.exit(
+                    f"[ERROR] Requested CUDA device(s) {bad} are not available. "
+                    f"This system has {n_cuda} CUDA device(s): "
+                    f"{list(range(n_cuda))}."
+                )
+            # Deduplicate while preserving order
+            seen, device_ids = set(), []
+            for d in args.cuda_devices:
+                if d not in seen:
+                    seen.add(d)
+                    device_ids.append(d)
+        else:
+            device_ids = [0]   # default: single GPU 0
+
+        primary_device = torch.device(f"cuda:{device_ids[0]}")
+
+    elif torch.backends.mps.is_available():
+        if args.cuda_devices is not None:
+            log.warning(
+                "--cuda-devices was specified but CUDA is not available; "
+                "falling back to MPS."
+            )
+        device_ids     = []
+        primary_device = torch.device("mps")
+
+    else:
+        if args.cuda_devices is not None:
+            log.warning(
+                "--cuda-devices was specified but neither CUDA nor MPS is "
+                "available; falling back to CPU."
+            )
+        device_ids     = []
+        primary_device = torch.device("cpu")
+
+    use_multi_gpu = len(device_ids) > 1
+
     log.info("Model      : %s", model_name)
     log.info("Chunks     : max %d × %d tokens", max_chunks, max_chunk_tokens)
     log.info("Class tok  : max %d tokens", max_class_tokens)
     log.info("Batch size : %d", args.batch_size)
+    if use_multi_gpu:
+        log.info(
+            "Device     : DataParallel across CUDA devices %s  (primary: %s)",
+            device_ids, primary_device,
+        )
+    else:
+        log.info("Device     : %s", primary_device)
 
     # ── Load pretrained model (NO fine-tuning weights) ────────────────────────
-    log.info("Loading pretrained UniXcoder backbone (zero-shot) ...")
+    log.info("Loading pretrained %s backbone (zero-shot) ...", model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    backbone  = AutoModel.from_pretrained(model_name).to(device)
+    _base     = AutoModel.from_pretrained(model_name)
 
-    # Freeze all parameters — this is a pure inference baseline, gradients
+    # Freeze all parameters — this is a pure inference baseline; gradients
     # are never needed and keeping them off saves memory.
-    for p in backbone.parameters():
+    for p in _base.parameters():
         p.requires_grad = False
+    _base.eval()
+
+    n_params = sum(p.numel() for p in _base.parameters())
+
+    # Wrap so forward() returns last_hidden_state as a plain tensor.
+    # This is required for DataParallel's gather to work correctly across all
+    # PyTorch versions (ModelOutput dataclasses are not reliably gathered).
+    backbone: torch.nn.Module = _BackboneCLSWrapper(_base).to(primary_device)
     backbone.eval()
 
-    n_params = sum(p.numel() for p in backbone.parameters())
-    log.info("Backbone loaded: %d parameters (all frozen)", n_params)
+    if use_multi_gpu:
+        backbone = torch.nn.DataParallel(backbone, device_ids=device_ids)
+        log.info(
+            "Backbone loaded: %d parameters (all frozen) — "
+            "DataParallel replicas on devices %s",
+            n_params, device_ids,
+        )
+    else:
+        log.info("Backbone loaded: %d parameters (all frozen)", n_params)
 
     shared_kwargs = dict(
         backbone         = backbone,
         tokenizer        = tokenizer,
-        device           = device,
+        device           = primary_device,
         max_chunk_tokens = max_chunk_tokens,
         max_class_tokens = max_class_tokens,
         max_chunks       = max_chunks,

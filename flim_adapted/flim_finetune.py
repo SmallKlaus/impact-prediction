@@ -371,7 +371,8 @@ def main():
 
     log.info("Building fine-tuning pairs from %s", cfg["train_jsonl"])
     pairs  = build_pairs(Path(cfg["train_jsonl"]), fcfg,
-                    ft.get("max_pairs_per_file", 30))
+                    ft.get("max_pairs_per_file", 30),
+                    cache_conn)
     ds     = PairDataset(pairs, tok, mcfg["nl_length"], mcfg["code_length"])
     loader = DataLoader(ds, batch_size=ft["batch_size"], shuffle=True,
                     num_workers=ft.get("num_workers", 4),
@@ -419,7 +420,7 @@ def main():
 
         # ── Validation ──
         model.eval()
-        mrr, r10 = file_level_eval(embed_par, tok, val_issues, cfg, primary)
+        mrr, r10 = file_level_eval(embed_par, tok, val_issues, cfg, primary, cache_conn)
         log.info("Epoch %02d/%02d | val MRR %.4f | val R@10 %.4f",
                  epoch, ft["epochs"], mrr, r10)
 
