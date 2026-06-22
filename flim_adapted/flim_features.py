@@ -178,6 +178,10 @@ def main():
             "AST-based segmentation. Can also be set via config['source_cache']."
         ),
     )
+    ap.add_argument(
+        "--overwrite", action="store_true",
+        help="If set, overwrite existing output. Otherwise existing output will be used to resume."
+    )
     args = ap.parse_args()
 
     cfg = json.load(open(args.config, encoding="utf-8"))
@@ -234,7 +238,65 @@ def main():
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Prepare resume/overwrite behavior.
+    processed: set[tuple[str, str]] = set()
     n_written = 0
+    resume_mode = False
+    if out_path.exists() and out_path.stat().st_size > 0 and not args.overwrite:
+        # Attempt to resume: sanitize possible trailing partial line, then read existing records.
+        log.info("Existing output detected — attempting resume from %s", out_path)
+        try:
+            # Ensure the file ends with a newline; if not, truncate the last partial line.
+            with open(out_path, "rb+") as fb:
+                fb.seek(0, os.SEEK_END)
+                size = fb.tell()
+                if size > 0:
+                    fb.seek(-1, os.SEEK_END)
+                    last = fb.read(1)
+                    if last != b"\n":
+                        pos = size - 1
+                        while pos >= 0:
+                            fb.seek(pos)
+                            ch = fb.read(1)
+                            if ch == b"\n":
+                                fb.truncate(pos + 1)
+                                break
+                            pos -= 1
+                        else:
+                            # no newline found — truncate entire file
+                            fb.truncate(0)
+        except Exception as e:
+            log.warning("Could not sanitize existing output file %s: %s", out_path, e)
+
+        # Read existing JSONL and collect processed (jira_id, class_path) pairs.
+        try:
+            with open(out_path, "r", encoding="utf-8") as f:
+                for lineno, line in enumerate(f, start=1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        log.warning("Skipping unparsable line %d in %s (likely partial)", lineno, out_path)
+                        continue
+                    jid = rec.get("jira_id")
+                    cp  = rec.get("class_path")
+                    if jid and cp is not None:
+                        processed.add((str(jid), str(cp)))
+            n_written = len(processed)
+            resume_mode = True
+            log.info("Resuming: %d existing records loaded from %s", n_written, out_path)
+        except Exception as e:
+            log.warning("Failed to read existing output %s: %s — starting fresh", out_path, e)
+            processed = set()
+            n_written = 0
+            resume_mode = False
+    else:
+        n_written = 0
+        processed = set()
+        resume_mode = False
 
     # Global cache hit/miss counters across all snapshots
     total_cache_hits   = 0
@@ -244,12 +306,32 @@ def main():
                     desc="Snapshots", unit="snap",
                     total=len(sha_classes), dynamic_ncols=True)
 
-    with open(out_path, "w", encoding="utf-8") as out_f:
+    mode = "a" if resume_mode else "w"
+    with open(out_path, mode, encoding="utf-8") as out_f:
         for sha, classes in snapshot_bar:
             paths = list(classes.keys())
             snapshot_bar.set_postfix(sha=sha[:8], n_classes=len(paths))
             log.info("─── Snapshot %s — %d candidate classes ───",
                      sha[:10], len(paths))
+
+            # Quick skip: if every (jira_id, class_path) that would be written for this
+            # snapshot already exists in `processed`, skip the whole snapshot to save work.
+            issues_here = [j for j, s in issue_to_sha.items() if s == sha]
+            all_done = True
+            for jid in issues_here:
+                recs = by_issue[jid]
+                label_of = {r.get("class_path", ""): int(r.get("label", 0)) for r in recs}
+                if sum(label_of.values()) == 0:
+                    continue
+                for cp in label_of.keys():
+                    if (str(jid), str(cp)) not in processed:
+                        all_done = False
+                        break
+                if not all_done:
+                    break
+            if all_done:
+                log.info("  Snapshot %s already fully processed — skipping.", sha[:10])
+                continue
 
             # ── Function extraction with source cache lookup ──
             func_texts, func_owner, n_funcs_per_class = [], [], []
@@ -355,6 +437,10 @@ def main():
                             len(path_toks[ci] | feat_toks)
                             if (path_toks[ci] | feat_toks) else 0.0),
                     }
+                    key = (str(jid), str(cp))
+                    if key in processed:
+                        continue
+
                     out_f.write(json.dumps({
                         "jira_id":     jid,
                         "class_path":  cp,
@@ -364,6 +450,7 @@ def main():
                         "features":    feats,
                     }, ensure_ascii=False) + "\n")
                     n_written += 1
+                    processed.add(key)
 
             log.info("  Snapshot %s done — running total written: %d",
                     sha[:10], n_written)

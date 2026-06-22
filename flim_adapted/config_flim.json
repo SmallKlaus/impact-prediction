@@ -5,7 +5,7 @@
   "output_dir":"/data1/amine/checkpoints/flim_run_001",
   "source_cache":"/data1/amine/IMPACT_TRAINING_SAMPLES/SAMPLES_V4/source_cache.sqlite ",
   "model": {
-    "model_name":"microsoft/codebert-base",
+    "model_name":"/data1/amine/codebert-base",
     "nl_length": 128,
     "code_length": 256,
     "scale": 20.0
