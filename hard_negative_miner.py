@@ -1,13 +1,13 @@
 """
 hard_negative_miner.py — Model-driven hard-negative mining for the impact bi-encoder
-=====================================================================================
+====
 After each epoch (from `start_epoch` onwards) we replace the *hard negative* slice
 of the training set with samples that the current model itself ranks too high.
 This closes the train/inference gap and mirrors the schedule used in DPR / ANCE /
 RocketQA.
 
 Workflow per mining round
--------------------------
+----
 1. Read `train_full.jsonl` (produced by step_11 style enumeration) once at the
    start of training. Each line is one (jira_id, class) pair carrying the same
    fields as the regular train samples (feature_text, feature_chunks, class_text,
@@ -26,15 +26,19 @@ Workflow per mining round
    training dataset.
 
 Performance notes
------------------
+----
 * Bi-encoder embeddings are pre-computed per (sha_before, class), so the inner
   loop over issues is a cheap matmul + interaction MLP call, not a transformer
   pass. The expensive transformer pass scales with `unique sha_before × classes
   per snapshot`, not `issues × classes`.
+* The class-encoding transformer pass is the dominant cost, so when multiple
+  CUDA devices are visible we wrap `encode_class` in nn.DataParallel and scatter
+  each `embed_batch_size` block across all GPUs. With 4 GPUs an embed_batch_size
+  of 256 runs as 64/GPU — same per-GPU VRAM as bs=64 on one card, ~4x faster.
 * All tensor work stays on the training device; only the final
   (top_k_per_issue) indices are pulled to host.
 * For very large codebases the candidate batch is sliced — `embed_batch_size`
-  controls peak VRAM.
+  controls peak VRAM (now the GLOBAL block size, split across GPUs).
 """
 from __future__ import annotations
 
@@ -43,9 +47,10 @@ import logging
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
@@ -55,7 +60,27 @@ from model import ImpactScoreModel
 log = logging.getLogger(__name__)
 
 
-# ── Candidate pool index ──────────────────────────────────────────────────────
+# ── Multi-GPU encode wrapper ────
+
+class _ClassEncoderModule(nn.Module):
+    """Thin nn.Module whose forward() delegates to model.encode_class.
+
+    nn.DataParallel only parallelises the wrapped module's `forward`, not custom
+    methods like `encode_class`. This adapter exposes encode_class AS forward so
+    DataParallel can scatter the (B, seq_len) batch across GPUs, run the encoder
+    replica on each, and gather the (B, proj_dim) embeddings back onto the
+    primary device. The underlying `model` is shared by reference (no weight
+    copy at construction — DP replicates per-forward).
+    """
+    def __init__(self, model: ImpactScoreModel):
+        super().__init__()
+        self.model = model
+
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        return self.model.encode_class(input_ids, attention_mask)
+
+
+# ── Candidate pool index ────
 
 @dataclass
 class CandidatePool:
@@ -66,7 +91,7 @@ class CandidatePool:
       * `by_jira_positives[jira_id]`   → set of positive class_paths for that issue
       * `by_jira_sha[jira_id]`         → sha_before of that issue (for grouping)
       * `by_jira_feature[jira_id]`     → (feature_text, feature_chunks)  — used to
-                                          stamp the mined sample dicts
+                    stamp the mined sample dicts
     """
     by_sha:           dict[str, list[dict]]
     by_jira_positives: dict[str, set[str]]
@@ -155,19 +180,24 @@ class CandidatePool:
         )
 
 
-# ── Encoding helpers ──────────────────────────────────────────────────────────
+# ── Encoding helpers ────
 
 @torch.no_grad()
 def _encode_classes_for_sha(
-    model:            ImpactScoreModel,
+    class_encoder:    Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     tokenizer:        PreTrainedTokenizerBase,
     records:          list[dict],
     device:           torch.device,
     max_class_tokens: int,
     embed_batch_size: int,
 ) -> torch.Tensor:
-    """Encode every candidate class for one sha_before into a (N, proj_dim) tensor."""
-    model.eval()
+    """Encode every candidate class for one sha_before into a (N, proj_dim) tensor.
+
+    `class_encoder` is a callable (ids, mask) -> (B, proj_dim). It is either the
+    bare `model.encode_class` (single GPU) or a DataParallel-wrapped adapter that
+    scatters each block across all visible GPUs. `embed_batch_size` is therefore
+    the GLOBAL block size; DataParallel splits it evenly per GPU.
+    """
     embeds: list[torch.Tensor] = []
 
     for start in range(0, len(records), embed_batch_size):
@@ -182,10 +212,10 @@ def _encode_classes_for_sha(
         )
         ids  = enc["input_ids"].to(device, non_blocking=True)
         mask = enc["attention_mask"].to(device, non_blocking=True)
-        c    = model.encode_class(ids, mask)              # (B, proj_dim)
+        c    = class_encoder(ids, mask)                   # (B, proj_dim)
         embeds.append(c)
 
-    return torch.cat(embeds, dim=0)                       # (N, proj_dim)
+    return torch.cat(embeds, dim=0)                    # (N, proj_dim)
 
 
 @torch.no_grad()
@@ -198,7 +228,12 @@ def _encode_feature_for_jira(
     max_chunk_tokens: int,
     max_chunks:       int,
 ) -> torch.Tensor:
-    """Encode one issue's feature description into a (proj_dim,) tensor."""
+    """Encode one issue's feature description into a (proj_dim,) tensor.
+
+    Feature encoding is a single issue (batch dim = 1, scattered over the chunk
+    axis internally), so DataParallel would not help here — kept on the primary
+    device. It is cheap relative to the per-sha class encode.
+    """
     model.eval()
 
     chunks = feature_chunks if feature_chunks else [{"text": feature_text}]
@@ -234,7 +269,7 @@ def _score_feature_against_classes(
     model.eval()
     N = class_embeds.size(0)
     scores: list[torch.Tensor] = []
-    f_proj = f_embed.unsqueeze(0)                          # (1, proj_dim)
+    f_proj = f_embed.unsqueeze(0)                    # (1, proj_dim)
 
     for start in range(0, N, score_batch):
         end   = min(start + score_batch, N)
@@ -246,7 +281,7 @@ def _score_feature_against_classes(
     return torch.cat(scores, dim=0)
 
 
-# ── Sample materialisation ────────────────────────────────────────────────────
+# ── Sample materialisation ────
 
 def _make_hard_neg_record(
     candidate_record: dict,
@@ -280,7 +315,7 @@ def _make_hard_neg_record(
     }
 
 
-# ── Public entry point ────────────────────────────────────────────────────────
+# ── Public entry point ────
 
 class HardNegativeMiner:
     """Holds the candidate pool + encoder-cache lifetime across the run."""
@@ -293,6 +328,7 @@ class HardNegativeMiner:
         max_class_tokens: int  = 512,
         max_chunks:       int  = 8,
         embed_batch_size: int  = 64,
+        use_data_parallel: bool = True,
     ):
         self.pool             = candidate_pool
         self.tokenizer        = tokenizer
@@ -300,6 +336,26 @@ class HardNegativeMiner:
         self.max_class_tokens = max_class_tokens
         self.max_chunks       = max_chunks
         self.embed_batch_size = embed_batch_size
+        self.use_data_parallel = use_data_parallel
+
+    def _build_class_encoder(
+        self,
+        model:  ImpactScoreModel,
+        device: torch.device,
+    ) -> tuple[Callable[[torch.Tensor, torch.Tensor], torch.Tensor], int]:
+        """Return a (callable, n_gpus) pair for class encoding.
+
+        When >1 CUDA device is visible and use_data_parallel is on, wrap the
+        encode_class adapter in nn.DataParallel so each embed_batch_size block
+        is scattered across all GPUs. Otherwise return the bare method.
+        """
+        n_gpus = torch.cuda.device_count() if device.type == "cuda" else 0
+        if self.use_data_parallel and n_gpus > 1:
+            wrapper = _ClassEncoderModule(model).to(device)
+            wrapper.eval()
+            dp = nn.DataParallel(wrapper)            # device_ids defaults to all visible GPUs
+            return dp, n_gpus
+        return model.encode_class, max(n_gpus, 1)
 
     def mine(
         self,
@@ -321,6 +377,20 @@ class HardNegativeMiner:
         """
         was_training = model.training
         model.eval()
+
+        # Build the (possibly DataParallel) class encoder for this round.
+        class_encoder, n_gpus = self._build_class_encoder(model, device)
+        if isinstance(class_encoder, nn.DataParallel):
+            log.info(
+                "HN mining: class encoding parallelised across %d GPUs "
+                "(embed_batch_size=%d → ~%d/GPU).",
+                n_gpus, self.embed_batch_size, self.embed_batch_size // n_gpus,
+            )
+        else:
+            log.info(
+                "HN mining: single-device class encoding (embed_batch_size=%d).",
+                self.embed_batch_size,
+            )
 
         # Group requested issues by sha_before so each codebase is encoded once
         issues_by_sha: dict[str, list[str]] = defaultdict(list)
@@ -349,13 +419,13 @@ class HardNegativeMiner:
         for sha in pbar:
             records = self.pool.by_sha[sha]
             class_embeds = _encode_classes_for_sha(
-                model            = model,
+                class_encoder    = class_encoder,
                 tokenizer        = self.tokenizer,
                 records          = records,
                 device           = device,
                 max_class_tokens = self.max_class_tokens,
                 embed_batch_size = self.embed_batch_size,
-            )                                                          # (N, proj_dim)
+            )                    # (N, proj_dim)
             class_paths = [r.get("class_path", "") for r in records]
 
             for jid in issues_by_sha[sha]:
@@ -379,7 +449,7 @@ class HardNegativeMiner:
                     model        = model,
                     f_embed      = f_embed,
                     class_embeds = class_embeds,
-                )                                                       # (N,) CPU
+                )                    # (N,) CPU
 
                 positives = self.pool.by_jira_positives.get(jid, set())
 
@@ -387,8 +457,8 @@ class HardNegativeMiner:
                 # Use a large negative value, then top-k by score.
                 if positives:
                     mask = torch.tensor(
-                        [(cp in positives) for cp in class_paths],
-                        dtype=torch.bool,
+                    [(cp in positives) for cp in class_paths],
+                    dtype=torch.bool,
                     )
                     scores = scores.masked_fill(mask, float("-inf"))
 
@@ -402,10 +472,10 @@ class HardNegativeMiner:
 
                 mined[jid] = [
                     _make_hard_neg_record(
-                        candidate_record = records[i],
-                        jira_id          = jid,
-                        feature_text     = feature_text,
-                        feature_chunks   = feature_chunks,
+                    candidate_record = records[i],
+                    jira_id          = jid,
+                    feature_text     = feature_text,
+                    feature_chunks   = feature_chunks,
                     )
                     for i in top_idx
                 ]
@@ -414,6 +484,12 @@ class HardNegativeMiner:
             del class_embeds
             if device.type == "cuda":
                 torch.cuda.empty_cache()
+
+        # Drop the DataParallel replicas / wrapper before returning so they don't
+        # linger in GPU memory during the next training epoch.
+        del class_encoder
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
         if was_training:
             model.train()
@@ -426,7 +502,7 @@ class HardNegativeMiner:
         return mined
 
 
-# ── Config helper ─────────────────────────────────────────────────────────────
+# ── Config helper ────
 
 def build_miner_from_config(
     config:    dict,
@@ -449,10 +525,11 @@ def build_miner_from_config(
 
     tcfg = config.get("training", {}) or {}
     return HardNegativeMiner(
-        candidate_pool   = pool,
-        tokenizer        = tokenizer,
-        max_chunk_tokens = tcfg.get("max_chunk_tokens", 512),
-        max_class_tokens = tcfg.get("max_class_tokens", 512),
-        max_chunks       = tcfg.get("max_chunks", 8),
-        embed_batch_size = hnm_cfg.get("embed_batch_size", 64),
+        candidate_pool    = pool,
+        tokenizer         = tokenizer,
+        max_chunk_tokens  = tcfg.get("max_chunk_tokens", 512),
+        max_class_tokens  = tcfg.get("max_class_tokens", 512),
+        max_chunks        = tcfg.get("max_chunks", 8),
+        embed_batch_size  = hnm_cfg.get("embed_batch_size", 64),
+        use_data_parallel = hnm_cfg.get("use_data_parallel", True),
     )
