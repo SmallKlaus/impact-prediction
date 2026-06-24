@@ -1,6 +1,6 @@
 """
-diagnose.py — Per-Issue and Per-Project Retrieval Diagnostic
-=============================================================
+diagnose_multigpu.py — Per-Issue and Per-Project Retrieval Diagnostic (Multi-GPU)
+==================================================================================
 Loads a trained checkpoint and runs inference on the full-codebase val set,
 then produces:
 
@@ -13,42 +13,54 @@ then produces:
 All results are written to a JSON report and printed as a readable table.
 
 Usage:
-    python diagnose.py \
-        --checkpoint  /data/amine/checkpoints/run_002/best_model.pt \
-        --config      /data/amine/checkpoints/run_002/config.json \
-        --val-jsonl   /data/amine/IMPACT_TRAINING_SAMPLES/val_full.jsonl \
-        --output      /data/amine/checkpoints/run_002/diagnosis.json \
-        [--batch-size 64] \
-        [--worst-n    20] \
-        [--no-amp]         # disable FP16 if you see NaN/Inf
+    python diagnose_multigpu.py \\
+        --checkpoint  /data1/amine/checkpoints/run_016/best_model.pt \\
+        --config      /data1/amine/checkpoints/run_016/config.json \\
+        --val-jsonl   /data1/amine/IMPACT_TRAINING_SAMPLES/SAMPLES_V4/test_full.jsonl \\
+        --output      /data1/amine/checkpoints/run_016/diagnosis.json \\
+        [--batch-size 64]     # per-GPU batch size; effective total = 64 × 4 = 256
+        [--worst-n    20] \\
+        [--no-amp] \\          # disable FP16 if you see NaN/Inf
+        [--gpu-ids 0,1,2,3]   # restrict to specific GPUs (default: all available)
 
 The --config flag expects the config.json saved alongside the checkpoint
 (it is written automatically by train.py into output_dir/config.json).
 
-Performance notes (vs original)
---------------------------------
+Performance notes
+-----------------
   1. AMP (FP16): halves activation memory and runs ~1.5–2× faster on
      Ampere/Turing GPUs.  Disabled on CPU/MPS automatically. Pass
      --no-amp to force FP32 (useful for debugging numerics).
 
   2. Deferred GPU→CPU transfer: probabilities accumulate as GPU tensors
      inside the loop, then a single torch.cat(...).cpu() at the end does
-     one host-device sync instead of one per batch.  At batch_size=64 and
-     3 M samples that's 46 875 syncs → 1 sync.
+     one host-device sync instead of one per batch.
 
   3. DataLoader: persistent_workers keeps worker processes alive between
      batches (no fork overhead), prefetch_factor=4 means 4 batches are
-     pre-tokenised and sitting in shared memory waiting while the GPU
-     processes the current one.  num_workers is set to min(cpu_count, 16)
-     so every available core is tokenising in parallel.
+     pre-tokenised and sitting in shared memory.  num_workers is set to
+     min(cpu_count, 4 × n_gpus) so workers scale with GPU count.
 
-  4. Default batch_size raised 16 → 64.  At batch_size=16 the VRAM
-     pressure was ~3.8 GB out of 11 GB available — the GPU was doing
-     many small launches rather than saturating its SMs.  64 fills about
-     8–9 GB with AMP enabled, leaving a safe margin.  If you OOM, pass
-     --batch-size 32; if you want more throughput, try --batch-size 128.
+  4. DataParallel (multi-GPU): When ≥2 CUDA GPUs are available, the model
+     is wrapped with nn.DataParallel.  Each forward pass, DP:
+       (a) scatters the batch evenly across all GPU devices (dim 0 split),
+       (b) runs the model in parallel on each GPU,
+       (c) gathers outputs back onto the primary GPU (cuda:0).
+     No process spawning or torchrun needed — this is inference only.
 
-Expected wall-clock improvement: ~8–12× (25 h → 2–3 h on an RTX 2080 Ti).
+     With 4× RTX 2080 Ti (11 GB each):
+       - --batch-size 64  →  64 samples per GPU  →  256 samples per step
+       - Each GPU uses ~8–9 GB VRAM with AMP enabled
+       - Expected throughput gain: ~3.5–4× vs single GPU
+       - Total wall-clock estimate: ~30–45 min vs 2–3 h single-GPU
+
+  5. Checkpoint compatibility: if the checkpoint was saved from a
+     DataParallel-wrapped model (keys prefixed with "module."), that prefix
+     is stripped automatically before loading into the bare model.  So
+     checkpoints from both plain and DP training are handled transparently.
+
+  6. GPU selection: use --gpu-ids 0,1 to restrict to GPUs 0 and 1, or set
+     CUDA_VISIBLE_DEVICES=0,1 in the environment before launching.
 """
 
 from __future__ import annotations
@@ -63,6 +75,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 from tqdm import tqdm
@@ -210,6 +223,18 @@ def compute_binary_metrics(all_scores: list[float], all_labels: list[int]) -> di
         return {}
 
 
+# ── VRAM helper ───────────────────────────────────────────────────────────────
+
+def log_vram(label: str, gpu_ids: list[int]) -> None:
+    """Log allocated / total VRAM for each GPU in gpu_ids."""
+    log.info("VRAM — %s:", label)
+    for gid in gpu_ids:
+        props = torch.cuda.get_device_properties(gid)
+        alloc = torch.cuda.memory_allocated(gid) / 1e9
+        total = props.total_memory / 1e9
+        log.info("  GPU %d (%s): %.1f / %.1f GB", gid, props.name, alloc, total)
+
+
 # ── Inference pass ────────────────────────────────────────────────────────────
 
 @torch.no_grad()
@@ -222,22 +247,27 @@ def run_inference(
     """
     Returns parallel lists of (scores, labels, jira_ids, class_paths).
 
-    Key perf changes vs original
-    ─────────────────────────────
-    • AMP (use_amp=True): FP16 forward pass — ~1.5–2× faster, half the VRAM.
+    Works transparently with both a bare model and an nn.DataParallel-wrapped
+    model — DP scatter/gather is handled inside the model() call.
+
+    Key perf notes
+    ──────────────
+    • AMP (use_amp=True): FP16 forward pass — ~1.5–2× faster, half VRAM.
       Sigmoid and list operations stay in FP32 automatically.
 
     • Deferred GPU→CPU transfer: logits stay on-device as a list of tensors;
-      a single torch.cat(...).cpu() at the end is one CUDA sync instead of
-      one per batch.  Labels and metadata are already small/CPU-side so
-      those are still transferred inline.
+      a single torch.cat(...).cpu() at the end is one CUDA sync for the whole
+      dataset instead of one per batch.
 
     • Non-blocking .to(): overlaps H→D copy with the previous iteration's
       GPU compute when pin_memory=True on the DataLoader.
+
+    • With DataParallel: DP scatters the batch across all GPUs and gathers
+      logits back onto the primary GPU (cuda:0) before returning.  The code
+      below is identical to single-GPU — DP is transparent to the caller.
     """
     model.eval()
 
-    # Accumulate probabilities on-device; transfer once at the end.
     prob_chunks:     list[torch.Tensor] = []
     label_chunks:    list[torch.Tensor] = []
     all_jira_ids:    list[str]          = []
@@ -249,8 +279,8 @@ def run_inference(
 
     pbar = tqdm(loader, desc="Inference", leave=True)
     for batch in pbar:
-        # non_blocking=True lets the H→D copy overlap with GPU work
-        # from the previous iteration (requires pin_memory=True on loader).
+        # Move all batch tensors to the primary device.
+        # With DataParallel, DP will then scatter them to the other GPUs.
         batch = batch.to(device, non_blocking=True)
 
         with amp_ctx:
@@ -262,8 +292,8 @@ def run_inference(
                 batch.class_attention_mask,
             )
 
+        # logits are gathered on the primary GPU by DP; safe to accumulate here.
         prob_chunks.append(torch.sigmoid(logits).detach())
-        # Labels are int; tiny compared to activations — OK to move inline.
         label_chunks.append(batch.labels.int().detach())
         all_jira_ids.extend(batch.jira_ids)
         all_class_paths.extend(batch.class_paths)
@@ -285,11 +315,41 @@ def diagnose(
     batch_size:      int,
     worst_n:         int,
     use_amp:         bool = True,
+    gpu_ids:         list[int] | None = None,
 ):
-    tcfg   = config["training"]
-    device = torch.device("cuda" if torch.cuda.is_available() else
-                          "mps"  if torch.backends.mps.is_available() else "cpu")
-    log.info("Device: %s", device)
+    tcfg = config["training"]
+
+    # ── GPU / device setup ────────────────────────────────────────────────────
+    if torch.cuda.is_available():
+        available = list(range(torch.cuda.device_count()))
+        if gpu_ids is None:
+            gpu_ids = available
+        else:
+            invalid = [g for g in gpu_ids if g not in available]
+            if invalid:
+                raise ValueError(
+                    f"Requested GPU IDs {invalid} not available. "
+                    f"Available: {available}"
+                )
+        n_gpus     = len(gpu_ids)
+        primary    = gpu_ids[0]
+        device     = torch.device(f"cuda:{primary}")
+        log.info(
+            "Device: CUDA — %d GPU(s) [%s], primary: cuda:%d",
+            n_gpus, ", ".join(f"cuda:{g}" for g in gpu_ids), primary,
+        )
+    elif torch.backends.mps.is_available():
+        device  = torch.device("mps")
+        gpu_ids = []
+        n_gpus  = 0
+        log.info("Device: MPS (Apple Silicon)")
+    else:
+        device  = torch.device("cpu")
+        gpu_ids = []
+        n_gpus  = 0
+        log.info("Device: CPU")
+
+    # AMP is only effective on CUDA
     if device.type == "cuda" and use_amp:
         log.info("AMP: enabled (FP16 inference)")
     elif device.type != "cuda" and use_amp:
@@ -308,19 +368,37 @@ def diagnose(
 
     log.info("Loading checkpoint: %s", checkpoint_path)
     state = torch.load(checkpoint_path, map_location=device)
+
+    # Extract the raw state dict (handle both bare and "model_state"-keyed saves)
+    raw_state = state.get("model_state", state)
+
+    # Strip "module." prefix produced by DataParallel when saving.
+    # This makes the checkpoint compatible regardless of whether it was saved
+    # from a plain model or a DataParallel-wrapped one.
+    if any(k.startswith("module.") for k in raw_state.keys()):
+        log.info("  Stripping 'module.' prefix from checkpoint keys "
+                 "(checkpoint was saved from a DataParallel model)")
+        raw_state = {k[len("module."):]: v for k, v in raw_state.items()}
+
+    model.load_state_dict(raw_state)
     if "model_state" in state:
-        model.load_state_dict(state["model_state"])
         log.info("  Loaded from full checkpoint (epoch %d)", state.get("epoch", "?"))
     else:
-        model.load_state_dict(state)
         log.info("  Loaded model weights directly")
 
+    # Log VRAM before DataParallel expansion
     if device.type == "cuda":
+        log_vram("after model load (before DataParallel)", gpu_ids)
+
+    # ── Wrap with DataParallel ────────────────────────────────────────────────
+    if n_gpus > 1:
+        model = nn.DataParallel(model, device_ids=gpu_ids)
         log.info(
-            "VRAM after model load: %.1f / %.1f GB",
-            torch.cuda.memory_allocated(device) / 1e9,
-            torch.cuda.get_device_properties(device).total_memory / 1e9,
+            "DataParallel: model replicated across %d GPUs [%s]",
+            n_gpus, ", ".join(f"cuda:{g}" for g in gpu_ids),
         )
+    else:
+        log.info("DataParallel: disabled (single device)")
 
     # ── Build val dataloader ──────────────────────────────────────────────────
     log.info("Loading val set: %s", val_jsonl)
@@ -333,25 +411,26 @@ def diagnose(
         label_smoothing  = 0.0,
     )
 
-    # Number of DataLoader workers: use all available CPU cores up to 16.
-    # More workers than 16 rarely helps (GIL + tokenizer overhead).
-    n_workers = min(os.cpu_count() or 4, 16)
-    log.info("DataLoader workers: %d  |  batch_size: %d", n_workers, batch_size)
+    # Effective batch size: each GPU processes `batch_size` samples per step.
+    # Total samples per step = batch_size × n_gpus.
+    effective_batch = batch_size * max(n_gpus, 1)
+
+    # DataLoader workers: 4 per GPU, capped at cpu_count.
+    # More workers keep the GPUs fed during tokenisation.
+    n_workers = min(os.cpu_count() or 4, max(16, 4 * max(n_gpus, 1)))
+    log.info(
+        "DataLoader: %d workers  |  per-GPU batch %d  |  effective batch %d",
+        n_workers, batch_size, effective_batch,
+    )
 
     val_loader = DataLoader(
         val_ds,
-        batch_size         = batch_size,
+        batch_size         = effective_batch,
         shuffle            = False,
         collate_fn         = collate_fn,
         num_workers        = n_workers,
         pin_memory         = device.type == "cuda",  # required for non_blocking=True
-        # persistent_workers: keeps worker processes alive between batches.
-        # Avoids the fork+import overhead at the start of every batch when
-        # num_workers > 0.  ~5–10% throughput improvement on large datasets.
         persistent_workers = n_workers > 0,
-        # prefetch_factor: each worker pre-tokenises this many batches ahead.
-        # While the GPU is processing batch N, workers are already tokenising
-        # batches N+1 … N+prefetch_factor, so the GPU is never starved.
         prefetch_factor    = 4 if n_workers > 0 else None,
     )
     log.info("Val samples: %d", len(val_ds))
@@ -362,11 +441,7 @@ def diagnose(
     )
 
     if device.type == "cuda":
-        log.info(
-            "VRAM after inference: %.1f / %.1f GB",
-            torch.cuda.memory_allocated(device) / 1e9,
-            torch.cuda.get_device_properties(device).total_memory / 1e9,
-        )
+        log_vram("after inference", gpu_ids)
 
     # ── Group by issue ────────────────────────────────────────────────────────
     log.info("Grouping %d predictions by issue ...", len(all_scores))
@@ -551,7 +626,7 @@ def diagnose(
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Per-issue retrieval diagnostic")
+    parser = argparse.ArgumentParser(description="Per-issue retrieval diagnostic (multi-GPU)")
     parser.add_argument("--checkpoint",  required=True,
                         help="Path to checkpoint (.pt file)")
     parser.add_argument("--config",      required=True,
@@ -561,13 +636,19 @@ def main():
     parser.add_argument("--output",      required=True,
                         help="Path to write diagnosis.json")
     parser.add_argument("--batch-size",  type=int, default=64,
-                        help="Inference batch size (default 64).  "
-                             "With AMP ~8 GB VRAM.  Use 32 if you OOM, "
-                             "128 if you have headroom.")
+                        help="Per-GPU batch size (default 64). "
+                             "With AMP, each RTX 2080 Ti uses ~8-9 GB VRAM at this size. "
+                             "Effective total = batch_size × n_gpus (256 across 4 GPUs). "
+                             "Use 32 if you OOM on a single GPU, 128 for more throughput.")
     parser.add_argument("--worst-n",     type=int, default=20,
                         help="Number of worst issues to highlight (default 20)")
     parser.add_argument("--no-amp",      action="store_true",
                         help="Disable AMP/FP16 inference (use if you see NaN/Inf)")
+    parser.add_argument("--gpu-ids",     type=str, default=None,
+                        help="Comma-separated CUDA GPU IDs to use "
+                             "(e.g. '0,1,2,3' for all four 2080 Tis, or '0,1' for two). "
+                             "Defaults to all available CUDA GPUs. "
+                             "Alternatively, set CUDA_VISIBLE_DEVICES before launching.")
     args = parser.parse_args()
 
     checkpoint_path = Path(args.checkpoint)
@@ -583,6 +664,17 @@ def main():
         if not p.exists():
             import sys; sys.exit(f"{name} not found: {p}")
 
+    # Parse optional GPU-ID list
+    gpu_ids: list[int] | None = None
+    if args.gpu_ids is not None:
+        try:
+            gpu_ids = [int(x.strip()) for x in args.gpu_ids.split(",")]
+        except ValueError:
+            import sys; sys.exit(
+                f"--gpu-ids must be a comma-separated list of integers "
+                f"(e.g. '0,1,2,3'), got: {args.gpu_ids!r}"
+            )
+
     with open(config_path, encoding="utf-8") as f:
         config = json.load(f)
 
@@ -594,6 +686,7 @@ def main():
         batch_size      = args.batch_size,
         worst_n         = args.worst_n,
         use_amp         = not args.no_amp,
+        gpu_ids         = gpu_ids,
     )
 
 
